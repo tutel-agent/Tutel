@@ -77,7 +77,7 @@ def record_time(is_cuda=None):
     if is_cuda:
         import torch
         torch.cuda.synchronize()
-    return time.time()
+    return time.perf_counter()
 
 def save(t, path):
     import numpy as np
@@ -89,6 +89,51 @@ def load(path, device=None):
     import torch
     npv = np.load(path)
     return torch.tensor(npv, device=device)
+
+def perform(fn, num_runs=100):
+    [fn() for _ in range(5)]
+    t0 = record_time()
+    [fn() for _ in range(num_runs)]
+    t1 = record_time()
+    cost = (t1 - t0) / num_runs
+    print('Function Latency = %.8lf sec\n' % cost)
+    return max(cost, 1e-6)
+
+
+def from_url(link):
+  import requests
+  import tempfile
+  file_name = tempfile.mktemp()
+
+  if not os.path.exists(file_name) and link is not None:
+    dirname = os.path.dirname(file_name) or '.'
+    try:
+      os.makedirs(dirname)
+    except FileExistsError:
+      pass
+    origin_name = file_name
+    with open(origin_name, "wb") as fp:
+      response = requests.get(link, stream=True)
+      total_length = response.headers.get('content-length')
+
+      if total_length is None:
+        fp.write(response.content)
+      else:
+        dl = 0
+        total_length = int(total_length)
+        for data in response.iter_content(chunk_size=4096):
+          dl += len(data)
+          fp.write(data)
+          done = int(50 * dl / total_length)
+          sys.stdout.write("\rDownloading %s [%s%s]" % (origin_name, '=' * done, ' ' * (50-done)) )
+          sys.stdout.flush()
+    print()
+  else:
+    print(f'Loading datafile `{file_name}` from local disk ..')
+  import numpy as np
+  import torch
+  x = np.load(file_name)
+  return torch.tensor(x)
 
 def apply_rank_size_from_pattern(filename, rank, size, create_dir=True):
     if not re.search(r'\{rank\}', filename):
