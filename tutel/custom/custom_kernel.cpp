@@ -1188,9 +1188,15 @@ torch::Tensor warp_deepseek_r1_attn_f16xf8_block_scal(
     key_cache.narrow(0, pos, 1).copy_(std::get<1>(inputs).permute({1, 0, 2}));
 
     auto Q = std::get<0>(inputs), C = key_cache.narrow(0, 0, pos + seqlen); // S2, B, (512 + 64)
-    auto scores = at::einsum("bshc,tbc->bsht", {Q, C}) * 0.1352337788608801f;
-    Q = at::einsum("bsht,tbc->bshc", {at::softmax(scores, -1), C}).narrow(-1, 0, 512);
-    Q = at::einsum("bshc,hdc->bshd", {Q, wvc}).contiguous();
+    if (batch == 1 && seqlen == 1) {
+      auto scores = antares::ops::call("scores_bf16", {Q.view({n_heads, Q.size(-1)}).view(torch::kInt32), C.squeeze(1).view(torch::kInt32)}, {0.1352337788608801f});
+      Q = torch::matmul(at::softmax(scores, -1), C.squeeze(1));
+      Q = antares::ops::call("logits_bf16", {Q.view(torch::kInt32), wvc.view(torch::kInt32)}, {});
+    } else {
+      auto scores = at::einsum("bshc,tbc->bsht", {Q, C}) * 0.1352337788608801f;
+      Q = at::einsum("bsht,tbc->bshc", {at::softmax(scores, -1), C}).narrow(-1, 0, 512);
+      Q = at::einsum("bshc,hdc->bshd", {Q, wvc}).contiguous();
+    }
     Q = warp_gemm_nt_bf16xfp8_block_scal(Q.view({batch, seqlen, -1}), o_proj, o_proj_scal);
     return Q;
   }
