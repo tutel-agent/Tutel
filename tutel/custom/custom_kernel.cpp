@@ -1126,9 +1126,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> warp_multi_head_latent_r
   CHECK_EQ(w_q_b_proj.dim(), 4);
   CHECK_EQ(k_b_proj.dtype(), torch::kBFloat16);
   CHECK_EQ(k_b_proj.dim(), 3);
+  CHECK_CONTIGUOUS(k_b_proj.transpose(1, 2));
 
-  auto qh = torch::matmul(w_q_b_proj, q.view({batch * seqlen, q.size(2)}).t()).view({2, n_local_heads, 128, batch * seqlen});
-  auto q_output = torch::matmul(qh[0].transpose(1, 2), k_b_proj);
+  auto qh = ((batch * seqlen <= 4) ? \
+    antares::ops::call("gmv_bf16", {w_q_b_proj.view({-1, w_q_b_proj.size(-1)}).view(torch::kInt32), q.view({batch * seqlen, q.size(2)}).view(torch::kInt32)}, {}) : \
+    torch::matmul(w_q_b_proj, q.view({batch * seqlen, q.size(2)}).t())).view({2, n_local_heads, 128, batch * seqlen});
+  auto q_output = (batch * seqlen == 1) ? \
+    antares::ops::call("bmv_bf16", {qh[0].squeeze(-1).view(torch::kInt32), k_b_proj.transpose(1, 2).view(torch::kInt32)}, {}).unsqueeze(1) : (batch * seqlen <= 4 ? \
+    antares::ops::call("bmm_bf16", {qh[0], k_b_proj.transpose(1, 2)}, {}) : torch::matmul(qh[0].transpose(1, 2), k_b_proj));
 
   q_output = antares::ops::call("rope_q_bf16", {q_output.view({n_local_heads, batch * seqlen, 16, 32}), cos_sin, qh[1].view({n_local_heads, 2, 32, 2, batch * seqlen}), positions}, {}).view({batch, seqlen, n_local_heads, 576});
   return {q_output, k_output, kv};
@@ -1171,19 +1176,21 @@ torch::Tensor warp_deepseek_r1_attn_f16xf8_block_scal(
     if (it2 == wkv_b_.end()) {
       auto _ = antares::ops::call("to_bfloat16_3d", {kv_b_proj.unsqueeze(0), kv_b_proj_scal.unsqueeze(0)}, {}).
         view({n_local_heads, 2, -1, kv_b_proj.size(-1)}).permute({1, 0, 2, 3}).contiguous(); // 2, H, 128, 512
-      wkv_b_[kv_b_proj_scal.data_ptr()] = {_.select(0, 0), _.select(0, 1).transpose(1, 2)}; // H, D(128), C(512)
+      wkv_b_[kv_b_proj_scal.data_ptr()] = {_.select(0, 0).transpose(1, 2).contiguous().transpose(1, 2), _.select(0, 1)}; // H, D(128), C(512)
       it2 = wkv_b_.find(kv_b_proj_scal.data_ptr());
     }
     auto wkc = std::get<0>(it2->second), wvc = std::get<1>(it2->second);
     auto qkv = warp_gemm_nt_bf16xfp8_block_scal(data, qkv_a_proj, qkv_a_proj_scal); // [B, S, 1536 + 512 + 64]
 
-    auto positions = torch::full({batch}, pos, torch::TensorOptions().dtype(torch::kInt64).device(data.device()));
+    static torch::Tensor posperm = torch::arange(0, cos_sin.size(0), torch::TensorOptions().dtype(torch::kInt64).device(data.device()));
+    auto positions = batch == 1 ? posperm.narrow(0, pos, 1) : torch::full({batch}, pos, torch::TensorOptions().dtype(torch::kInt64).device(data.device()));
     auto inputs = warp_multi_head_latent_rope_bf16(qkv, cos_sin, positions, q_a_norm, kv_a_norm, it->second, wkc, n_local_heads);
     key_cache.narrow(0, pos, 1).copy_(std::get<1>(inputs).permute({1, 0, 2}));
+
     auto Q = std::get<0>(inputs), C = key_cache.narrow(0, 0, pos + seqlen); // S2, B, (512 + 64)
     auto scores = at::einsum("bshc,tbc->bsht", {Q, C}) * 0.1352337788608801f;
     Q = at::einsum("bsht,tbc->bshc", {at::softmax(scores, -1), C}).narrow(-1, 0, 512);
-    Q = at::einsum("bshc,hcd->bshd", {Q, wvc}).contiguous();
+    Q = at::einsum("bshc,hdc->bshd", {Q, wvc}).contiguous();
     Q = warp_gemm_nt_bf16xfp8_block_scal(Q.view({batch, seqlen, -1}), o_proj, o_proj_scal);
     return Q;
   }
@@ -1200,48 +1207,22 @@ torch::Tensor warp_deepseek_r1_attn_f16xf8_block_scal(
   auto q_pe_out = torch::empty_like(q_pe);
   antares::ops::call("rotary_lookup_bf16", {cos_sin.select(0, pos).select(0, 0), cos_sin.select(0, pos).select(0, 1), q_pe.view({-1, 32, 2}), q_pe_out.view({-1, 2, 32})}, {}, false, 0, 3);
 
-  if (val_cache.numel() > 1) {
-    kv = warp_gemm_nt_bf16xfp8_block_scal(warp_rmsnorm_bf16(kv, kv_a_norm, 1e-6f), kv_b_proj, kv_b_proj_scal);
-
-    antares::ops::call("cache_fill_bf16", {q_pe_out, k_pe_out, query_states, key_cache.select(0, pos)}, {128}, false, 0, 3);
+  kv = warp_gemm_nt_bf16xfp8_block_scal(warp_rmsnorm_bf16(kv, kv_a_norm, 1e-6f), kv_b_proj, kv_b_proj_scal);
+  antares::ops::call("cache_fill_bf16", {q_pe_out, k_pe_out, query_states, key_cache.select(0, pos)}, {128}, false, 0, 3);
                                       // [B,S,H,64]  [B,S,64]  [B,S,H,128:]    [B,H,128:]
 
-    antares::ops::call("cache_move_bf16", {kv.view({batch, seqlen, n_heads, 2, 128}), key_cache.narrow(0, pos, seqlen), val_cache.narrow(0, pos, seqlen)}, {}, false, 0, 2);
+  antares::ops::call("cache_move_bf16", {kv.view({batch, seqlen, n_heads, 2, 128}), key_cache.narrow(0, pos, seqlen), val_cache.narrow(0, pos, seqlen)}, {}, false, 0, 2);
                                                  // [B,S,H,2,M]                                [S,B,H,:128]                 [S,B,H,:128]
 
-    auto key_states = key_cache.narrow(0, 0, pos + seqlen).view({1, pos + seqlen, batch * n_heads, 192});
-    auto value_states = val_cache.narrow(0, 0, pos + seqlen).view({1, pos + seqlen, batch * n_heads, 128});
-    query_states = query_states.permute({1, 0, 2, 3}).view({1, seqlen, -1, 192});
-    CHECK_EQ(query_states.size(1), 1);
+  auto key_states = key_cache.narrow(0, 0, pos + seqlen).view({1, pos + seqlen, batch * n_heads, 192});
+  auto value_states = val_cache.narrow(0, 0, pos + seqlen).view({1, pos + seqlen, batch * n_heads, 128});
+  query_states = query_states.permute({1, 0, 2, 3}).view({1, seqlen, -1, 192});
+  CHECK_EQ(query_states.size(1), 1);
 
-    auto lm = torch::empty({2, batch * n_heads, 64}, torch::TensorOptions().dtype(torch::kBFloat16).device(query_states.device()));
-    auto attn_output = antares::ops::call("self_attn_infer_bf16", {query_states.squeeze(0).squeeze(0), key_states.squeeze(0), value_states.squeeze(0), lm}, {0.1352337788608801f});
-    xb = torch::matmul(antares::ops::call("self_attn_reduce_bf16", {lm}, {}).unsqueeze(1), attn_output).to(query_states.dtype());
-
-    // xb = std::get<0>(at::native::_scaled_dot_product_attention_math(query_states.permute({0, 2, 1, 3}).to(torch::kBFloat16), key_states.permute({0, 2, 1, 3}).to(torch::kBFloat16), value_states.permute({0, 2, 1, 3}).to(torch::kBFloat16), {}, 0, false, {}, 0.1352337788608801)).permute({0, 2, 1, 3}).to(query_states.dtype());
-  } else {
-    kv = torch::cat({warp_rmsnorm_bf16(kv, kv_a_norm, 1e-6f), k_pe_out}, -1); // [B, S, 512]
-    key_cache.narrow(0, pos, seqlen).narrow(1, 0, batch) = kv.permute({1, 0, 2}); // [S, B, 512 + 64]
-
-    static std::unordered_map<void*, torch::Tensor> wkv_b_;
-    auto it = wkv_b_.find(kv_b_proj_scal.data_ptr());
-    if (it == wkv_b_.end()) {
-      wkv_b_[kv_b_proj_scal.data_ptr()] = antares::ops::call("to_bfloat16_3d", {kv_b_proj.unsqueeze(0), kv_b_proj_scal.unsqueeze(0)}, {}).
-        view({n_heads, 2, -1, kv_b_proj.size(-1)}).permute({1, 0, 2, 3}).contiguous(); // 2, H, 128, 512
-      it = wkv_b_.find(kv_b_proj_scal.data_ptr());
-    }
-    auto _0 = it->second.select(0, 0), _1 = it->second.select(0, 1); // H, D(128), C(512)
-    // k_pe_out, q_pe_out -- 1, 1, 64 | 1, 1, 16, 64
-    auto q_nope = query_states.narrow(-1, 0, 128).contiguous(); // B, S, H, D
-    q_nope = at::einsum("bshd,hdc->bshc", {q_nope, _0}).contiguous(); // B, S, H, C(512)
-    q_nope = torch::cat({q_nope, q_pe_out}, -1);
-
-    auto R = key_cache.narrow(0, 0, pos + seqlen); // S2, B, (512 + 64)
-    auto scores_ = at::einsum("bshc,tbc->bsht", {q_nope, R}) * 0.1352337788608801f;
-    _0 = at::einsum("bsht,tbc->bshc", {at::softmax(scores_, -1), R});
-    _0 = _0.narrow(-1, 0, 512).contiguous();
-    xb = at::einsum("bshc,hdc->bshd", {_0, _1}).contiguous();
-  }
+  auto lm = torch::empty({2, batch * n_heads, 64}, torch::TensorOptions().dtype(torch::kBFloat16).device(query_states.device()));
+  auto attn_output = antares::ops::call("self_attn_infer_bf16", {query_states.squeeze(0).squeeze(0), key_states.squeeze(0), value_states.squeeze(0), lm}, {0.1352337788608801f});
+  xb = torch::matmul(antares::ops::call("self_attn_reduce_bf16", {lm}, {}).unsqueeze(1), attn_output).to(query_states.dtype());
+  // xb = std::get<0>(at::native::_scaled_dot_product_attention_math(query_states.permute({0, 2, 1, 3}).to(torch::kBFloat16), key_states.permute({0, 2, 1, 3}).to(torch::kBFloat16), value_states.permute({0, 2, 1, 3}).to(torch::kBFloat16), {}, 0, false, {}, 0.1352337788608801)).permute({0, 2, 1, 3}).to(query_states.dtype());
   xb = warp_gemm_nt_bf16xfp8_block_scal(xb.view({batch, seqlen, -1}), o_proj, o_proj_scal);
   return xb;
 }
@@ -1405,7 +1386,7 @@ void warp_deepseek_r1_prepare_weights(
   ::cos_sin = cos_sin;
 
   int n_layers = o_projs.size();
-  bool use_lora = getenv("LORA") ? (std::atoi(getenv("LORA")) == 1) : (batch >= 4);
+  bool use_lora = getenv("LORA") ? (std::atoi(getenv("LORA")) == 1) : true;
   if (use_lora) {
     // kv_lora_rank + qk_rope_head_dim
     ::key_cache = torch::zeros({n_layers, max_seq_len, batch, 512 + 64}, torch::TensorOptions().dtype(token_emb.dtype()).device(token_emb.device()));
