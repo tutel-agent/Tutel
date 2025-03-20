@@ -16,6 +16,15 @@ We compare three solutions that support <ins>Full-Precision Inference (PPL = 0) 
 
 ## What's New:
 
+- Tutel v0.4.1: Support fused MLA for R1 for AMD MI300x8:
+```sh
+  >> Example:
+
+    docker run -it --rm --ipc=host --privileged -p 8000:8000 \
+        -v /:/host -w /host$(pwd) tutelgroup/deepseek-671b:mi300x8-chat-20250319 \
+        --model_path ./deepseek-ai/DeepSeek-R1 --prompt "Calculate the result of: 1 / (sqrt(5) - sqrt(3))"
+```
+
 - Tutel v0.4.0: Accelerating Deepseek R1 Full-precision-Chat for AMD MI300x8 (more platform support will be added in later versions):
 ```sh
   >> Example:
