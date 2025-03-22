@@ -995,7 +995,25 @@ void show(const std::vector<torch::Tensor> &xs) {
   }
 }
 
+torch::Tensor warp_to_float32(const torch::Tensor &w, const torch::Tensor &scal) {
+  CHECK_CUDA(w);
+  CHECK_CUDA(scal);
+
+  auto w_ = w, scal_ = scal;
+  if (w_.dim() < 3)
+    w_ = w_.unsqueeze(0), scal_ = scal_.unsqueeze(0);
+  CHECK_EQ(w_.dim(), 3);
+  CHECK_EQ(scal_.dim(), 3);
+  w_ = antares::ops::call("to_float32_3d", {w_, scal_}, {});
+  if (w.dim() < 3)
+    w_ = w_.squeeze(0);
+  return w_;
+}
+
 torch::Tensor warp_to_bfloat16(const torch::Tensor &w, const torch::Tensor &scal) {
+  CHECK_CUDA(w);
+  CHECK_CUDA(scal);
+
   auto w_ = w, scal_ = scal;
   if (w_.dim() < 3)
     w_ = w_.unsqueeze(0), scal_ = scal_.unsqueeze(0);
@@ -1017,11 +1035,16 @@ torch::Tensor warp_to_bfloat16(const torch::Tensor &w, const torch::Tensor &scal
 torch::Tensor warp_gemm_nt_bf16xfp8_block_scal(const torch::Tensor &x, const torch::Tensor &w, const torch::Tensor &scal, int64_t policy = 0) {
   CHECK_CUDA(x);
   CHECK_EQ(x.dim(), 3);
-  CHECK_EQ(w.dim(), 2);
   CHECK_EQ(x.dtype(), torch::kBFloat16);
+  CHECK_EQ(w.dim(), 2);
 
   int samples = x.size(0) * x.size(1);
+  if (scal.dim() == 1) {
+    CHECK_EQ(w.size(0), scal.size(0));
+    return antares::ops::call("gemv_nt_bf16xfp8_row", {x.view({samples, x.size(2)}).view(torch::kInt32), w.view(torch::kInt16), scal}, {}).view({x.size(0), x.size(1), w.size(0)});
+  }
 
+  CHECK_EQ(scal.dim(), 2);
   if (w.dtype() == torch::kBFloat16)
     return torch::matmul(x.view({samples, x.size(2)}), w.t()).view({x.size(0), x.size(1), w.size(0)});
 
@@ -1052,29 +1075,6 @@ torch::Tensor warp_rmsnorm_bf16(const torch::Tensor &x, const torch::Tensor &rms
   return antares::ops::call("rmsnorm_bf16", {x.view({-1, x.size(-1)}).view(torch::kInt32), rms_w.view(torch::kInt32)}, {eps, id / 2}).view(torch::kBFloat16).view({x.size(0), x.size(1), -1});
 }
 
-std::tuple<torch::Tensor, torch::Tensor> warp_deepseek_sigmoid_top_8_static(
-     const torch::Tensor &logits_bf16,
-     const torch::Tensor &moe_gate_b_bf16,
-     const ::std::optional<torch::Tensor> &top_v_out_,
-     const ::std::optional<torch::Tensor> &top_k_out_) {
-  CHECK_CUDA(logits_bf16);
-  CHECK_EQ(logits_bf16.dtype(), torch::kBFloat16);
-  CHECK_EQ(moe_gate_b_bf16.dtype(), torch::kBFloat16);
-
-  int n_experts = logits_bf16.size(-1);
-  AT_ASSERTM(n_experts == 256, "Deepseek R1 requires 256 experts for gating.");
-  int samples = logits_bf16.numel() / n_experts;
-
-  auto device = logits_bf16.device();
-  auto top_v_out = top_v_out_.has_value() ? top_v_out_.value().view({samples, -1}) : torch::empty({samples, 8}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-  auto top_k_out = top_k_out_.has_value() ? top_k_out_.value().view({samples, -1}) : torch::empty({samples, 8}, torch::TensorOptions().dtype(torch::kInt32).device(device));
-  AT_ASSERTM(top_v_out.dtype() == torch::kFloat32 && top_k_out.dtype() == torch::kInt32, "Output tensor space should be float32 for top_scores and int32 for top_ids.");
-
-  antares::ops::call("deepseek_r1_sigmoid_top_k_f32", {logits_bf16.view({samples, n_experts}), moe_gate_b_bf16, top_v_out, top_k_out}, {}, false, 0, 3);
-  return {top_v_out, top_k_out};
-}
-
-
 std::tuple<torch::Tensor, torch::Tensor> warp_deepseek_sigmoid_top_8_static_v2(
      const torch::Tensor &logits_bf16,
      const torch::Tensor &moe_gate_b_bf16,
@@ -1096,6 +1096,49 @@ std::tuple<torch::Tensor, torch::Tensor> warp_deepseek_sigmoid_top_8_static_v2(
   antares::ops::call("deepseek_r1_sigmoid_top_k_routed_scaled_f32", {logits_bf16.view({samples, n_experts}), moe_gate_b_bf16, top_v_out, top_k_out}, {}, false, 0, 3);
   return {top_v_out, top_k_out};
 }
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> warp_multi_head_latent_rope_bf16_v2(
+  const torch::Tensor &qkv_act,
+  const torch::Tensor &cos_sin,
+  const torch::Tensor &positions,
+  const torch::Tensor &q_a_norm,
+  const torch::Tensor &kv_a_norm,
+  const torch::Tensor &q_b_proj,
+  const torch::Tensor &k_b_proj,
+  int64_t n_local_heads
+) {
+  auto x = qkv_act;
+  CHECK_CUDA(x);
+  CHECK_EQ(x.dtype(), torch::kBFloat16);
+  CHECK_EQ(x.dim(), 3);
+  CHECK_EQ(x.size(-1), 2112);
+  CHECK_EQ(cos_sin.dtype(), torch::kFloat32);
+  CHECK_EQ(positions.dtype(), torch::kInt64);
+
+  int batch = qkv_act.size(0), seqlen = qkv_act.size(1);
+  int samples = batch * seqlen;
+
+  auto q = warp_rmsnorm_bf16(x, q_a_norm, 1e-6f);
+  auto v_output = warp_rmsnorm_bf16(x, kv_a_norm, 1e-6f, 1536); // [B, S, 512]
+  auto k_output = antares::ops::call("rope_k_bf16", {v_output.view({samples, 16, 32}), cos_sin, x.view({samples, 33, 32, 2}), positions}, {}).view({batch, seqlen, 576});
+
+  auto &w_q_b_proj = q_b_proj;
+  CHECK_EQ(w_q_b_proj.dtype(), torch::kBFloat16);
+  CHECK_EQ(w_q_b_proj.dim(), 2);
+  CHECK_EQ(k_b_proj.dtype(), torch::kBFloat16);
+  CHECK_EQ(k_b_proj.dim(), 3);
+  CHECK_CONTIGUOUS(k_b_proj.transpose(1, 2));
+
+  auto q_output = torch::empty({batch, seqlen, n_local_heads, 512 + 64}, torch::TensorOptions().dtype(q.dtype()).device(q.device()));
+  torch::Tensor qh = (samples >= 4) ? torch::matmul(q, w_q_b_proj.t()).view({samples, n_local_heads, -1}) : \
+    antares::ops::call("rope_gmv_bf16", {q.view({samples, -1}).view(torch::kInt32), w_q_b_proj.view(torch::kInt32)}, {}).view({samples, n_local_heads, -1});
+  auto buffer = q_output.flatten(0, 1).transpose(0, 1).narrow(-1, 0, 512);
+  torch::matmul_out(buffer, qh.transpose(0, 1).narrow(-1, 0, 128), k_b_proj);
+
+  antares::ops::call("rope_q_bf16_put", {cos_sin.view(torch::kInt64), qh.view({qh.size(0), n_local_heads, 3, 16, 2, 2}), positions, q_output.view({qh.size(0), n_local_heads, 9, 2, 32}).view(torch::kInt32)}, {});
+  return {q_output, k_output, v_output};
+}
+
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> warp_multi_head_latent_rope_bf16(
   const torch::Tensor &qkv_act,
@@ -1166,7 +1209,7 @@ torch::Tensor warp_deepseek_r1_attn_f16xf8_block_scal(
     auto it = q_b_cache.find(q_b_proj.data_ptr());
     if (it == q_b_cache.end()) {
       auto w_q_b_proj = warp_to_bfloat16(q_b_proj, q_b_proj_scal);
-      w_q_b_proj = torch::pad(w_q_b_proj.view({n_local_heads, -1, w_q_b_proj.size(1)}), {0, 0, 0, 64}).view({n_local_heads, 2, -1, w_q_b_proj.size(1)}).permute({1, 0, 2, 3}).contiguous();
+      // w_q_b_proj = torch::pad(w_q_b_proj.view({n_local_heads, -1, w_q_b_proj.size(1)}), {0, 0, 0, 64}).view({n_local_heads, 2, -1, w_q_b_proj.size(1)}).permute({1, 0, 2, 3}).contiguous();
       q_b_cache[q_b_proj.data_ptr()] = w_q_b_proj;
       it = q_b_cache.find(q_b_proj.data_ptr());
     }
@@ -1184,7 +1227,7 @@ torch::Tensor warp_deepseek_r1_attn_f16xf8_block_scal(
 
     static torch::Tensor posperm = torch::arange(0, cos_sin.size(0), torch::TensorOptions().dtype(torch::kInt64).device(data.device()));
     auto positions = batch == 1 ? posperm.narrow(0, pos, 1) : torch::full({batch}, pos, torch::TensorOptions().dtype(torch::kInt64).device(data.device()));
-    auto inputs = warp_multi_head_latent_rope_bf16(qkv, cos_sin, positions, q_a_norm, kv_a_norm, it->second, wkc, n_local_heads);
+    auto inputs = warp_multi_head_latent_rope_bf16_v2(qkv, cos_sin, positions, q_a_norm, kv_a_norm, it->second, wkc, n_local_heads);
     key_cache.narrow(0, pos, 1).copy_(std::get<1>(inputs).permute({1, 0, 2}));
 
     auto Q = std::get<0>(inputs), C = key_cache.narrow(0, 0, pos + seqlen); // S2, B, (512 + 64)
@@ -1467,42 +1510,6 @@ torch::Tensor warp_deepseek_r1_forward(
     return torch::matmul(x, weight_classify.t());
 }
 
-torch::Tensor warp_glu_expert_f16xf8_block_scal_16x16(
-  const torch::Tensor &x,
-  const torch::Tensor &expert_ids,
-  const torch::Tensor &expert_weight,
-  const torch::Tensor &moe_gate_up_w,
-  const torch::Tensor &moe_gate_up_s,
-  const torch::Tensor &moe_down_w,
-  const torch::Tensor &moe_down_s) {
-
-  int model_dim = x.size(-1);
-  int samples = x.numel() / model_dim;
-
-  CHECK_CUDA(x);
-  CHECK_EQ(x.dtype(), torch::kBFloat16);
-  CHECK_EQ(x.dim(), 3);
-  CHECK_EQ(expert_ids.dim(), 2);
-  CHECK_EQ(expert_weight.dim(), 2);
-
-  CHECK_EQ(moe_gate_up_w.dim(), 5); // shape = [256, 32, 448, 16, 16]
-  CHECK_EQ(moe_gate_up_s.dim(), 3); // shape = [256, 4, 56]
-  CHECK_EQ(moe_gate_up_w.size(2), 448);
-  CHECK_EQ(moe_gate_up_w.size(-2), 16);
-  CHECK_EQ(moe_gate_up_w.size(-1), 16);
-
-  CHECK_EQ(moe_down_w.dim(), 5); // shape = [256, 448, 16, 16, 16]
-  CHECK_EQ(moe_down_s.dim(), 3); // shape = [256, 56, 2]
-  CHECK_EQ(moe_down_w.size(1), 448);
-  CHECK_EQ(moe_down_w.size(-2), 16);
-  CHECK_EQ(moe_down_w.size(-1), 16);
-
-  auto _0 = moe_gate_up_w.view({moe_gate_up_w.size(0), moe_gate_up_w.size(1) * moe_gate_up_w.size(3), moe_gate_up_w.size(2) * moe_gate_up_w.size(4)});
-  auto _1 = moe_down_w.view({moe_down_w.size(0), moe_down_w.size(1) * moe_down_w.size(3), moe_down_w.size(2) * moe_down_w.size(4)});
-  auto xb = antares::ops::call("gemm_gate_up_silu_bf16xf8_s_16x16", {x.view({samples, model_dim}).view(torch::kInt32), expert_ids, moe_gate_up_w.view(torch::kInt16), moe_gate_up_w.view(_0.sizes()).view(torch::kInt16), moe_gate_up_s}, {});
-  return antares::ops::call("gemm_down_weight_sum_bf16xf8_s_16x16", {xb.view(torch::kInt32), expert_weight, expert_ids, moe_down_w.view(torch::kInt16), moe_down_w.view(_1.sizes()).view(torch::kInt16), moe_down_s}, {}).view({x.size(0), x.size(1), _1.size(1)});
-}
-
 torch::Tensor warp_glu_expert_f16xf8_block_scal_16x16_fnuz(
   const torch::Tensor &x,
   const torch::Tensor &expert_ids,
@@ -1556,14 +1563,14 @@ TORCH_LIBRARY(tutel_ops, m) {
   m.def("deepseek_r1_prepare_weights", warp_deepseek_r1_prepare_weights);
   m.def("deepseek_r1_forward", warp_deepseek_r1_forward);
   m.def("multi_head_latent_rope_bf16", warp_multi_head_latent_rope_bf16);
+  m.def("multi_head_latent_rope_bf16_v2", warp_multi_head_latent_rope_bf16_v2);
 
-  m.def("deepseek_sigmoid_top_8_static", warp_deepseek_sigmoid_top_8_static);
   m.def("deepseek_sigmoid_top_8_static_v2", warp_deepseek_sigmoid_top_8_static_v2);
   m.def("rmsnorm_bf16", warp_rmsnorm_bf16);
   m.def("to_bfloat16", warp_to_bfloat16);
+  m.def("to_float32", warp_to_float32);
   m.def("glu_expert_bf16xf8_block_scal", warp_glu_expert_f16xf8_block_scal);
 
-  m.def("glu_expert_bf16xf8_block_scal_16x16", warp_glu_expert_f16xf8_block_scal_16x16);
   m.def("glu_expert_bf16xf8_block_scal_16x16_fnuz", warp_glu_expert_f16xf8_block_scal_16x16_fnuz);
 #endif
 }
