@@ -6,15 +6,42 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 - Supported GPUs: CUDA(fp64/fp32/fp16/bfp16), ROCm(fp64/fp32/fp16)
 - Supported CPU: fp64/fp32
 
-### ***Support Full Precision Inference of MoE-based Deepseek R1 671B on AMD MI300:***
-
-We compare three solutions that support <ins>Full-Precision Inference (PPL = 0) of Deepseek R1 671B</ins>. PPL = 0 means any quantization or unofficial sparsity techniques that may lower the scores of model, are prohibited.
-
-![benchmarking](doc/DeepSeekR1-tutel-accel.png)
-
------------
+#### - ***The First to Support DeepSeek 671B NVFP4 Inference using A100/A800/H100/MI300 resources.***
+#### - ***Fastest "Thinking" on MI300X: Complete a 4K reasoning answering in 39 sec, compared with SGLANG in 1 min 35 sec.***
 
 ## What's New:
+
+- Tutel v0.4.2: Support R1-FP4 for "NVIDIA A100/A800/H100/H800 (80G) x 8":
+```sh
+  >> Example:
+    huggingface-cli download nvidia/DeepSeek-R1-FP4 --local-dir ./nvidia/DeepSeek-R1-FP4
+
+    # For A100/A800 (80G x 8):
+    docker run -it --rm --ipc=host --privileged -p 8000:8000 \
+        --shm-size=1g --ulimit memlock=-1 --ulimit stack=67108864 --gpus=all -v /:/host -w /host$(pwd) \
+        tutelgroup/deepseek-671b:a100x8-chat-20250401 --model_path ./nvidia/DeepSeek-R1-FP4 \
+        --prompt "求1/sin(x) + x的不定积分"
+
+    # For H100/H800 (80G x 8):
+    docker run -it --rm --ipc=host --privileged -p 8000:8000 \
+        --shm-size=1g --ulimit memlock=-1 --ulimit stack=67108864 --gpus=all -v /:/host -w /host$(pwd) \
+        tutelgroup/deepseek-671b:h100x8-chat-20250401 --model_path ./nvidia/DeepSeek-R1-FP4 \
+        --prompt "求1/sin(x) + x的不定积分"
+```
+
+#### FP4 Dataset: nvidia/DeepSeek-R1-FP4
+|  ***Machine Type*** | ***TRT-LLM***  | ***SGLANG***  |  ***Tutel***  |
+|  ----  | ----  | ----  | ----  |
+| $"A100 \times 8" or "A800 \times 8"$ | Not Supported | Not Supported | 57 Decoding TPS for bsz = 1 |
+| $"H100 \times 8" or "H800 \times 8"$ | Not Supported | Not Supported | 81 Decoding TPS for bsz = 1 |
+| $MI300 \times 8$  | Not Supported | Not Supported | 96 Decoding TPS for bsz = 1 |
+
+#### FP8 Dataset: deepseek-ai/DeepSeek-R1 or deepseek-ai/DeepSeek-V3-0324
+|  ***Machine Type*** | ***TRT-LLM***  | ***SGLANG***  |  ***Tutel***  |
+|  ----  | ----  | ----  | ----  |
+| $"A100 \times 8" or "H100 \times 8"$ | OoM | OoM | OoM |
+| $MI300 \times 8$  | Not Supported | 42 Decoding TPS for bsz = 1 | 105 Decoding TPS for bsz = 1 |
+
 
 - Tutel v0.4.1: Support fused MLA for R1/V3-0324 for AMD MI300x8:
 ```sh
