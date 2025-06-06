@@ -1783,6 +1783,19 @@ torch::Tensor warp_copy_to_device(const std::vector<torch::Tensor> &data) {
   return out;
 }
 
+#include <dlfcn.h>
+
+torch::Tensor warp_ck_test(const torch::Tensor &x, const torch::Tensor &w, const torch::Tensor &x_scal, const torch::Tensor &w_scal, const torch::Tensor &map_ids) {
+  static void *dll = dlopen("/tmp/a.out", RTLD_LAZY | RTLD_LOCAL);
+  static void *fn = dlsym(dll, "Run");
+  auto stream = at::cuda::getDefaultCUDAStream().stream();
+
+  int N = x.size(-2), K = x.size(-1), M = w.size(-2), B = map_ids.size(0);
+  auto out = torch::zeros({B, N, M}, torch::TensorOptions().dtype(torch::kBFloat16).device(x.device()));
+  CHECK_EQ(((bool(*)(...))fn)(B, N, K, M, x.data_ptr(), w.data_ptr(), out.data_ptr(), x_scal.data_ptr(), w_scal.data_ptr(), map_ids.data_ptr(), stream), true);
+  return out;
+}
+
 torch::Tensor warp_glu_expert_bf16xf8_block_scal_16x16_fnuz(
   const torch::Tensor &x,
   const torch::Tensor &expert_ids,
@@ -1858,6 +1871,7 @@ TORCH_LIBRARY(tutel_ops, m) {
   m.def("to_float32", warp_to_float32);
   m.def("to_float8_block", warp_to_float8_block);
   m.def("copy_to_device", warp_copy_to_device);
+  m.def("ck_test", warp_ck_test);
 
   m.def("glu_expert_bf16xf8_block_scal_16x16_fnuz", warp_glu_expert_bf16xf8_block_scal_16x16_fnuz);
 #endif
