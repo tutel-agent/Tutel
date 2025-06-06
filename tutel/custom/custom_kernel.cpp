@@ -1741,6 +1741,36 @@ torch::Tensor warp_glu_expert_bf16xf8_block_scal_16x16_fnuz(
   return yb;
 }
 
+torch::Tensor warp_glu_expert_bf16xf8_noshared(
+  const torch::Tensor &x,
+  const torch::Tensor &topk_ids,
+  const torch::Tensor &topk_weights,
+  const torch::Tensor &gateup_1_weight,
+  const torch::Tensor &gateup_1_scal,
+  const torch::Tensor &gateup_2_weight_bf16,
+  const torch::Tensor &down_1_weight_bf16,
+  const torch::Tensor &down_2_weight,
+  const torch::Tensor &down_2_scal
+) {
+  constexpr int num_experts = 256;
+  CHECK_EQ(topk_ids.size(0), x.size(0));
+  CHECK_EQ(topk_ids.size(1), 8);
+  CHECK_EQ(topk_weights.size(1), 8);
+  CHECK_EQ(gateup_1_weight.size(0), num_experts);
+  CHECK_EQ(gateup_1_weight.dim(), 3);
+  CHECK_EQ(gateup_1_weight.size(1), 256);
+  CHECK_EQ(gateup_1_scal.size(0), 256);
+  CHECK_EQ(gateup_1_scal.dim(), 3);
+  CHECK_EQ(gateup_2_weight_bf16.dtype(), torch::kBFloat16);
+  CHECK_EQ(down_1_weight_bf16.dtype(), torch::kBFloat16);
+
+  auto y1 = antares::ops::call("fmoe_blkvect_phase_1_noshared", {x.view({x.size(0), 2, -1, 16}).view(torch::kInt32), topk_ids.flatten(), gateup_1_weight.view({num_experts, 256, 2, -1}).view(at::kComplexDouble), gateup_1_scal.view({num_experts, 2, 2, -1})}, {});
+  auto y2 = antares::ops::call("fmoe_blkvect_phase_2_noshared", {y1.view(torch::kInt32), topk_ids.flatten(), gateup_2_weight_bf16.view(torch::kInt32)}, {});
+  auto y3 = antares::ops::call("fmoe_blkvect_phase_3_noshared", {y2.view({y2.size(0), 2, -1}).view(torch::kInt32), topk_ids.flatten(), down_1_weight_bf16.view(torch::kInt32)}, {});
+  auto y4 = antares::ops::call("fmoe_blkvect_phase_4_noshared", {y3.view({x.size(0), 8, -1, 16}).view(torch::kInt32), topk_weights, topk_ids, down_2_weight.view(at::kComplexDouble), down_2_scal}, {});
+  return y4;
+}
+
 #endif
 
 
@@ -1776,6 +1806,7 @@ TORCH_LIBRARY(tutel_ops, m) {
   m.def("to_float32", warp_to_float32);
 
   m.def("glu_expert_bf16xf8_block_scal_16x16_fnuz", warp_glu_expert_bf16xf8_block_scal_16x16_fnuz);
+  m.def("glu_expert_bf16xf8_noshared", warp_glu_expert_bf16xf8_noshared);
 #endif
 }
 #endif
