@@ -14,7 +14,7 @@ if 'OP_LOADER' not in os.environ:
         suffix = 'rocm'
     os.environ['OP_LOADER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), suffix)
 
-def input_to_float8(
+def to_float8_rowwise(
     x: torch.Tensor, dim=-1, dtype: torch.dtype = torch.float8_e4m3fn, max_scale=None
 ):
     # sum_val = x.float().sum(dim=dim, keepdim=True) / x.size(dim)
@@ -31,6 +31,16 @@ def input_to_float8(
     # x_scl_sat.scale_mean = sum_val.squeeze(dim)
     return x_scl_sat
 
+def to_float4_groupwise(w):
+  assert w.size(-1) % 16 == 0
+  x = w.view(-1, 16)
+  scale_b = x.abs().amax(-1, keepdim=True).float() / 6
+  boundaries = torch.tensor([-10, -5, -3.5, -2.5, -1.75, -1.25, -0.75, -0.25, 0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5], dtype=torch.float32, device=w.device)
+  map_ids = torch.tensor([0, 15, 14, 13, 12, 11, 10,  9,  0,  8,  1,  2,  3,  4,  5,  6,  7], dtype=torch.uint8, device=w.device)
+  scale_o = scale_b.amax() / 448
+  fp4_vals = map_ids.index_select(0, torch.bucketize(x / scale_b, boundaries, right=True, out_int32=True).clamp(1, 16).flatten()).view(*w.shape[:-1],   w.shape[-1] // 2, 2).chunk(2, dim=-1)
+  scale_b = (scale_b / scale_o).to(torch.float8_e4m3fn).view(*w.shape[:-1], w.shape[-1] // 16)
+  return (fp4_vals[0] + (fp4_vals[1] << 4)).squeeze(-1), scale_b, scale_o
 
 def __getattr__(name):
     fn = getattr(torch.ops.tutel_ops, name)
