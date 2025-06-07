@@ -999,6 +999,16 @@ std::tuple<torch::Tensor, torch::Tensor> warp_to_float8_block(torch::Tensor w) {
   return {fp8_w, scal};
 }
 
+std::tuple<torch::Tensor, torch::Tensor> warp_to_float8_per_token(const torch::Tensor &w) {
+  CHECK_CUDA(w);
+  CHECK_EQ(w.dtype(), torch::kBFloat16);
+
+  auto local_w = w.view({-1, 128}).view(torch::kInt32);
+  auto scal = torch::empty({local_w.size(0)}, torch::TensorOptions().dtype(torch::kFloat32).device(w.device()));
+  auto fp8_w = antares::ops::call("to_float8_per_token", {local_w, scal}, {}).view(at::kFloat8_e4m3fn).view(w.sizes());
+  return {fp8_w, scal.view(fp8_w.narrow(-1, 0, fp8_w.size(-1) / 128).sizes())};
+}
+
 torch::Tensor warp_to_float32(const torch::Tensor &w, const torch::Tensor &scal) {
   CHECK_CUDA(w);
   CHECK_CUDA(scal);
@@ -1870,6 +1880,7 @@ TORCH_LIBRARY(tutel_ops, m) {
   m.def("to_bfloat16", warp_to_bfloat16);
   m.def("to_float32", warp_to_float32);
   m.def("to_float8_block", warp_to_float8_block);
+  m.def("to_float8_per_token", warp_to_float8_per_token);
   m.def("copy_to_device", warp_copy_to_device);
   m.def("ck_test", warp_ck_test);
 
