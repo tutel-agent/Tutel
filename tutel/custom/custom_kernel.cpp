@@ -1795,14 +1795,17 @@ torch::Tensor warp_copy_to_device(const std::vector<torch::Tensor> &data) {
 
 #include <dlfcn.h>
 
-torch::Tensor warp_ck_test(const torch::Tensor &x, const torch::Tensor &w, const torch::Tensor &x_scal, const torch::Tensor &w_scal, const torch::Tensor &map_ids) {
+torch::Tensor warp_ck_test(const torch::Tensor &x, const torch::Tensor &x_scal, const torch::Tensor &w, const torch::Tensor &w_scal, const torch::Tensor &map_counts, const torch::Tensor &reverse_ids, const torch::Tensor &out) {
   static void *dll = dlopen("/tmp/a.out", RTLD_LAZY | RTLD_LOCAL);
   static void *fn = dlsym(dll, "Run");
   auto stream = at::cuda::getDefaultCUDAStream().stream();
 
-  int N = x.size(-2), K = x.size(-1), M = w.size(-2), B = map_ids.size(0);
-  auto out = torch::zeros({B, N, M}, torch::TensorOptions().dtype(torch::kBFloat16).device(x.device()));
-  CHECK_EQ(((bool(*)(...))fn)(B, N, K, M, x.data_ptr(), w.data_ptr(), out.data_ptr(), x_scal.data_ptr(), w_scal.data_ptr(), map_ids.data_ptr(), stream), true);
+  CHECK_EQ(out.dim(), 2);
+  CHECK_EQ(w.dim(), 3);
+
+  int PAGE = reverse_ids.size(0), BLOCK = reverse_ids.size(1);
+  int K = w.size(2), M = w.size(1), E = w.size(0);
+  CHECK_EQ(((bool(*)(...))fn)(E, PAGE, BLOCK, K, M, out.size(0), x.data_ptr(), w.data_ptr(), out.data_ptr(), x_scal.data_ptr(), w_scal.data_ptr(), map_counts.data_ptr(), reverse_ids.data_ptr(), stream), true);
   return out;
 }
 
