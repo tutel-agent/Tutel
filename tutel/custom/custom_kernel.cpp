@@ -1741,33 +1741,44 @@ torch::Tensor warp_glu_expert_bf16xf8_block_scal_16x16_fnuz(
   return yb;
 }
 
+std::tuple<torch::Tensor, torch::Tensor> warp_to_float8_per_token(const torch::Tensor &x, int64_t scale_width) {
+  CHECK_EQ(scale_width, 128);
+  auto shape = x.sizes().vec();
+  CHECK_EQ(shape.back() % scale_width, 0);
+  shape[shape.size() - 1] /= scale_width;
+  auto fp8_scal = torch::empty(shape, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+  auto fp8_out = antares::ops::call("to_float8_per_token_rocm", {x.view({-1, scale_width}).view(torch::kInt32), fp8_scal.flatten()}, {}).view(torch::kUInt8).view(x.sizes());
+  return {fp8_out, fp8_scal};
+}
+
 torch::Tensor warp_glu_expert_bf16xf8_noshared(
   const torch::Tensor &x,
   const torch::Tensor &topk_ids,
   const torch::Tensor &topk_weights,
-  const torch::Tensor &gateup_1_weight,
-  const torch::Tensor &gateup_1_scal,
-  const torch::Tensor &gateup_2_weight_bf16,
-  const torch::Tensor &down_1_weight_bf16,
-  const torch::Tensor &down_2_weight,
-  const torch::Tensor &down_2_scal
+  const torch::Tensor &B_w,
+  const torch::Tensor &B_scal,
+  const torch::Tensor &B_post,
+  const torch::Tensor &B_post_scal,
+  const torch::Tensor &C_prev,
+  const torch::Tensor &C_prev_scal,
+  const torch::Tensor &C_w,
+  const torch::Tensor &C_scal
 ) {
   constexpr int num_experts = 256;
   CHECK_EQ(topk_ids.size(0), x.size(0));
   CHECK_EQ(topk_ids.size(1), 8);
+  CHECK_EQ(topk_ids.dtype(), torch::kInt32);
   CHECK_EQ(topk_weights.size(1), 8);
-  CHECK_EQ(gateup_1_weight.size(0), num_experts);
-  CHECK_EQ(gateup_1_weight.dim(), 3);
-  CHECK_EQ(gateup_1_weight.size(1), 256);
-  CHECK_EQ(gateup_1_scal.size(0), 256);
-  CHECK_EQ(gateup_1_scal.dim(), 3);
-  CHECK_EQ(gateup_2_weight_bf16.dtype(), torch::kBFloat16);
-  CHECK_EQ(down_1_weight_bf16.dtype(), torch::kBFloat16);
+  CHECK_EQ(B_w.size(0), num_experts);
+  CHECK_EQ(B_w.dim(), 3);
+  CHECK_EQ(B_w.size(1), 256);
+  CHECK_EQ(B_scal.size(0), 256);
+  CHECK_EQ(B_scal.dim(), 3);
 
-  auto y1 = antares::ops::call("fmoe_blkvect_phase_1_noshared", {x.view({x.size(0), 2, -1, 16}).view(torch::kInt32), topk_ids.flatten(), gateup_1_weight.view({num_experts, 256, 2, -1}).view(at::kComplexDouble), gateup_1_scal.view({num_experts, 2, 2, -1})}, {});
-  auto y2 = antares::ops::call("fmoe_blkvect_phase_2_noshared", {y1.view(torch::kInt32), topk_ids.flatten(), gateup_2_weight_bf16.view(torch::kInt32)}, {});
-  auto y3 = antares::ops::call("fmoe_blkvect_phase_3_noshared", {y2.view({y2.size(0), 2, -1}).view(torch::kInt32), topk_ids.flatten(), down_1_weight_bf16.view(torch::kInt32)}, {});
-  auto y4 = antares::ops::call("fmoe_blkvect_phase_4_noshared", {y3.view({x.size(0), 8, -1, 16}).view(torch::kInt32), topk_weights, topk_ids, down_2_weight.view(at::kComplexDouble), down_2_scal}, {});
+  auto y1 = antares::ops::call("fmoe_blkvect_phase_1_noshared", {x.view({x.size(0), 2, -1, 16}).view(torch::kInt32), topk_ids.flatten(), B_w.view({num_experts, 256, 2, -1}).view(at::kComplexDouble), B_scal.view({num_experts, 2, 2, -1})}, {});
+  auto y2 = antares::ops::call("fmoe_blkvect_phase_2_noshared", {y1.view(torch::kInt32), topk_ids.flatten(), B_post.view(torch::kInt16), B_post_scal}, {});
+  auto y3 = antares::ops::call("fmoe_blkvect_phase_3_noshared", {y2.view({y2.size(0), 2, -1}).view(torch::kInt32), topk_ids.flatten(), C_prev.view(torch::kInt16), C_prev_scal}, {});
+  auto y4 = antares::ops::call("fmoe_blkvect_phase_4_noshared", {y3.view({x.size(0), 8, -1, 16}).view(torch::kInt32), topk_weights, topk_ids, C_w.view(at::kComplexDouble), C_scal}, {});
   return y4;
 }
 
@@ -1807,6 +1818,7 @@ TORCH_LIBRARY(tutel_ops, m) {
 
   m.def("glu_expert_bf16xf8_block_scal_16x16_fnuz", warp_glu_expert_bf16xf8_block_scal_16x16_fnuz);
   m.def("glu_expert_bf16xf8_noshared", warp_glu_expert_bf16xf8_noshared);
+  m.def("to_float8_per_token", warp_to_float8_per_token);
 #endif
 }
 #endif
