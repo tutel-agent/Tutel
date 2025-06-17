@@ -59,7 +59,7 @@ def fp8_gen(shape):
 
 def main():
     E = 256
-    policy = os.environ.get('POLICY', 'moe_forward_policy_32')
+    policy = os.environ.get('POLICY', 'moe_forward_policy_36')
     batch = int(os.environ.get('BATCH', 32))
 
     A = torch.randn([batch, 7168], device='cuda', dtype=torch.bfloat16)
@@ -72,6 +72,8 @@ def main():
 
     if policy == 'moe_forward_policy_32':
       from tutel.ops.moe_forward_policy_32 import moe_forward as opt_moe_full
+    elif policy == 'moe_forward_policy_36':
+      from tutel.ops.moe_forward_policy_36 import moe_forward as opt_moe_full
     elif policy == 'moe_forward_policy_3200':
       from tutel.ops.moe_forward_policy_3200 import moe_forward as opt_moe_full
     else:
