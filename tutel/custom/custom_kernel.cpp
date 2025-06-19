@@ -1764,7 +1764,7 @@ torch::Tensor warp_glu_expert_bf16xf8_noshared(
   const torch::Tensor &C_w,
   const torch::Tensor &C_scal
 ) {
-  constexpr int num_experts = 256;
+  const int num_experts = C_w.size(0);
   CHECK_EQ(topk_ids.size(0), x.size(0));
   CHECK_EQ(topk_ids.size(1), 8);
   CHECK_EQ(topk_ids.dtype(), torch::kInt32);
@@ -1781,6 +1781,31 @@ torch::Tensor warp_glu_expert_bf16xf8_noshared(
   auto y4 = antares::ops::call("fmoe_blkvect_phase_4_noshared", {y3.view({x.size(0), 8, -1, 16}).view(torch::kInt32), topk_weights, topk_ids, C_w.view(at::kComplexDouble), C_scal}, {});
   return y4;
 }
+
+torch::Tensor warp_glu_expert_bf16xf8_down_noshared(
+  const torch::Tensor &x,
+  const torch::Tensor &topk_ids,
+  const torch::Tensor &topk_weights,
+  const torch::Tensor &C_w,
+  const torch::Tensor &C_scal
+) {
+  CHECK_EQ(topk_ids.dim(), 2);
+  CHECK_EQ(topk_ids.size(1), 8);
+  CHECK_EQ(topk_ids.dtype(), torch::kInt32);
+
+  return antares::ops::call("fmoe_blkvect_phase_4_noshared", {x.view({topk_ids.size(0), 8, -1, 16}).view(torch::kInt32), topk_weights, topk_ids, C_w.view(at::kComplexDouble), C_scal}, {});
+}
+
+torch::Tensor warp_topk_token_sort(
+  const torch::Tensor &topk_ids,
+  const torch::Tensor &num_tokens_post_padded,
+  int64_t pages
+) {
+  const int E = num_tokens_post_padded.numel();
+  auto sorted_token_ids = torch::empty({E, pages}, torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device()));
+  return antares::ops::call("token_sort_i32", {topk_ids.flatten(), num_tokens_post_padded, sorted_token_ids}, {}).flatten();
+}
+
 
 #endif
 
@@ -1818,6 +1843,8 @@ TORCH_LIBRARY(tutel_ops, m) {
 
   m.def("glu_expert_bf16xf8_block_scal_16x16_fnuz", warp_glu_expert_bf16xf8_block_scal_16x16_fnuz);
   m.def("glu_expert_bf16xf8_noshared", warp_glu_expert_bf16xf8_noshared);
+  m.def("glu_expert_bf16xf8_down_noshared", warp_glu_expert_bf16xf8_down_noshared);
+  m.def("topk_token_sort", warp_topk_token_sort);
   m.def("to_float8_per_token", warp_to_float8_per_token);
 #endif
 }

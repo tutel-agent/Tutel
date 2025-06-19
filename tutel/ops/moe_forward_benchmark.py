@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license
 
 import functools
 import json
@@ -49,7 +51,8 @@ def compare(L, R):
     if L.shape != R.shape:
         return print('Shapes differ', L.shape, R.shape)
     diff = (R - L).abs().argmax().item()
-    print('Max Diff:', (R - L).abs().max().item(), L.flatten()[diff], 'v.s.', R.flatten()[diff])
+    diff_val = (R - L).abs().max().item()
+    print('Max Diff:', diff_val, L.flatten()[diff], 'v.s.', R.flatten()[diff])
 
 def fp8_gen(shape):
     v = (torch.randn(shape, device='cuda') / 100).to(torch.float8_e4m3fnuz)
@@ -59,7 +62,7 @@ def fp8_gen(shape):
 
 def main():
     E = 256
-    policy = os.environ.get('POLICY', 'moe_forward_policy_36')
+    policy = os.environ.get('POLICY', 'moe_forward_policy_33')
     batch = int(os.environ.get('BATCH', 32))
 
     A = torch.randn([batch, 7168], device='cuda', dtype=torch.bfloat16)
@@ -72,6 +75,8 @@ def main():
 
     if policy == 'moe_forward_policy_32':
       from tutel.ops.moe_forward_policy_32 import moe_forward as opt_moe_full
+    elif policy == 'moe_forward_policy_33':
+      from tutel.ops.moe_forward_policy_33 import moe_forward as opt_moe_full
     elif policy == 'moe_forward_policy_36':
       from tutel.ops.moe_forward_policy_36 import moe_forward as opt_moe_full
     elif policy == 'moe_forward_policy_3200':
@@ -80,6 +85,8 @@ def main():
       raise Exception(f'Unrecognized policy typr: {policy}')
 
     L = opt_moe_full(A, topk_ids, topk_weights, B, B_post, C_prev, C)
+    opt_moe_full(A, topk_ids, topk_weights, B, B_post, C_prev, C)
+    opt_moe_full(A, topk_ids, topk_weights, B, B_post, C_prev, C)
 
     from torch.profiler import profile, record_function, ProfilerActivity
     with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
