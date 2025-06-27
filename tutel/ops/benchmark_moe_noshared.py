@@ -84,7 +84,7 @@ def main():
     else:
       raise Exception(f'Unrecognized policy typr: {policy}')
 
-    L = opt_moe_full(A, topk_ids, topk_weights, B, B_post, C_prev, C)
+    opt_moe_full(A, topk_ids, topk_weights, B, B_post, C_prev, C)
     opt_moe_full(A, topk_ids, topk_weights, B, B_post, C_prev, C)
     opt_moe_full(A, topk_ids, topk_weights, B, B_post, C_prev, C)
 
@@ -92,7 +92,7 @@ def main():
     with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
       with record_function("model_inference"):
         for i in range(100):
-          opt_moe_full(A, topk_ids, topk_weights, B, B_post, C_prev, C)
+          L = opt_moe_full(A, topk_ids, topk_weights, B, B_post, C_prev, C)
     print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
 
     if batch <= 3200:
