@@ -77,8 +77,8 @@ def main():
     C = fp8_gen([E, 7168, 128])
     topk_ids = torch.randint(0, E, [batch, 8], device='cuda', dtype=torch.int32)
     topk_weights = torch.randn(topk_ids.shape, device='cuda')
-    shared_B_bf16 = torch.randn([512, 7168], device='cuda', dtype=torch.bfloat16) / 3000
-    shared_C_bf16 = torch.randn([7168, 256], device='cuda', dtype=torch.bfloat16) / 3000
+    shared_B_bf16 = torch.randn([512, 7168], device='cuda', dtype=torch.bfloat16) / 300
+    shared_C_bf16 = torch.randn([7168, 256], device='cuda', dtype=torch.bfloat16) / 300
 
     try:
         from moe_forward_policy_33_shared import moe_forward as opt_moe_full

@@ -323,8 +323,12 @@ def silu_mul(x, x_shared=None):
     return torch.nn.functional.silu(x.narrow(-1, 0, x.size(-1) // 2)) * x.narrow(-1, x.size(-1) // 2, x.size(-1) // 2)
 
 def moe_forward(x, topk_ids, topk_weights, B, B_post, C_prev, C, shared_B_bf16, shared_C_bf16, layer_info=(0, 1)):
+    bsz = x.numel() // x.size(-1)
+    if bsz > 36:
+        from tutel.ops.moe_forward_policy_3200_shared import moe_forward as moe_forward_fn
+        return moe_forward_fn(x, topk_ids, topk_weights, B, B_post, C_prev, C, shared_B_bf16, shared_C_bf16)
+
     assert triton.__version__ >= '3.3.0', 'Please use triton>=3.3.0 to ensure reproducible Triton performance.'
-    assert x.numel() // x.size(-1) <= 36, 'Please choose bigger policy for larger batch size.'
     assert topk_ids.dim() == 2 and topk_ids.size(1) == 8, "topk_ids should be of Shape[BSZ, 8]"
 
     E, block_size_M = B.size(0), 16
