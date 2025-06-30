@@ -1,16 +1,13 @@
-#!/usr/bin/env python3
-
-import functools
-import json
-import logging
-import os, sys
-from typing import Any, Callable, Dict, List, Optional, Tuple
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 
 import torch
+from tutel import ops
+
+from torch.utils.cpp_extension import IS_HIP_EXTENSION
+
 import triton
 import triton.language as tl
-
-from tutel import ops
 
 scale_width = 128
 
@@ -39,7 +36,7 @@ def weighted_sum(x, w, shared_out):
     return y
 
 @triton.jit
-def fused_moe_kernel(
+def fused_moe_kernel_ex(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -81,8 +78,8 @@ def fused_moe_kernel(
     GROUP_SIZE_M: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
-    compute_type: tl.constexpr,
     use_a_scale: tl.constexpr,
+    compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
@@ -135,14 +132,13 @@ def fused_moe_kernel(
     # and accumulate
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + pid_m)
-    if num_tokens_post_padded == 0: # pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
-    local_offset = tl.arange(0, BLOCK_SIZE_M)
-    offs_token_id = pid_m * BLOCK_SIZE_M + local_offset
-    token_mask = local_offset < num_tokens_post_padded
-
-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id, mask=token_mask, other=num_valid_tokens).to(tl.int64)
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    offs_token = offs_token.to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -150,7 +146,7 @@ def fused_moe_kernel(
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
-    off_experts = pid_m # tl.load(expert_ids_ptr + pid_m)
+    off_experts = tl.load(expert_ids_ptr + pid_m)
     b_ptrs = (
         b_ptr
         + off_experts * stride_be
@@ -222,14 +218,11 @@ def fused_moe_kernel(
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
 
                 if use_a_scale:
-                    a_scale = tl.load(
-                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
-                    )
+                    a_scale = tl.load(a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0)
                     accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
                 else:
                     accumulator += tl.dot(a, b.to(compute_type)) * b_scale[None, :]
             else:
-                assert False
                 # fix out of shared memory issue
                 if use_fp8_w8a8:
                     accumulator = tl.dot(a, b, acc=accumulator)
@@ -264,30 +257,16 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-def moe_one_layer(A, A_scale, B, B_scale, topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, config, C=None):
-    from torch.utils.cpp_extension import IS_HIP_EXTENSION
-    if not IS_HIP_EXTENSION:
-      config.pop('waves_per_eu', None)
-
+def moe_one_layer(A, A_scale, B, B_scale, topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, config):
     assert sorted_token_ids is None or config['BLOCK_SIZE_M'] == sorted_token_ids.block_size_M
+
     if A.dtype == torch.uint8:
         A = A.view(torch.float8_e4m3fnuz)
-
-    C = C if C is not None else torch.empty([*topk_ids.shape, B.size(1)], device=A.device, dtype=torch.bfloat16)
-
+    C = torch.empty([*topk_ids.shape, B.size(1)], device=A.device, dtype=torch.bfloat16)
     padded_size = 0
     grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),)
 
-    fused_moe_kernel[grid](
-            A,						# torch.Size([3200, 7168])		torch.float8_e4m3fnuz
-            B,						# torch.Size([256, 2048, 7168])	torch.float8_e4m3fnuz
-            C,						# torch.Size([3200, 8, 2048])		torch.bfloat16
-            A_scale,				# torch.Size([3200, 56])			torch.float32
-            B_scale,				# torch.Size([256, 16, 56])		torch.float32
-            topk_weights,			# torch.Size([3200, 8])			torch.float32
-            sorted_token_ids,		# torch.Size([33536])				torch.int32
-            expert_ids,				# torch.Size([1048])				torch.int32
-            num_tokens_post_padded,	# tensor([29216], device='cuda:0', dtype=torch.int32)
+    fused_moe_kernel_ex[grid](A, B, C, A_scale, B_scale, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded,
             B.shape[1],
             B.shape[2] - padded_size,
             sorted_token_ids.shape[0],
@@ -319,53 +298,44 @@ def moe_one_layer(A, A_scale, B, B_scale, topk_ids, topk_weights, sorted_token_i
     return C
 
 @torch.compile
-def silu_mul(x, x_shared=None):
+def silu_mul(x):
     return torch.nn.functional.silu(x.narrow(-1, 0, x.size(-1) // 2)) * x.narrow(-1, x.size(-1) // 2, x.size(-1) // 2)
 
-def moe_forward(x, topk_ids, topk_weights, B, B_post, C_prev, C, shared_B_bf16, shared_C_bf16, config_B=None, config_C=None, layer_info=(0, 1), **kwargs):
-    bsz = x.numel() // x.size(-1)
-    if bsz > 36:
-        from tutel.ops.moe_forward_policy_3200_shared import moe_forward as moe_forward_fn
-        return moe_forward_fn(x, topk_ids, topk_weights, B, B_post, C_prev, C, shared_B_bf16, shared_C_bf16)
-
+def moe_forward(x, topk_ids, topk_weights, B, B_post, C_prev, C, shared_B_bf16, shared_C_bf16, config_B=None, config_C=None, moe_align_sort_fn=None, **kwargs):
     # assert triton.__version__ >= '3.3.0', 'Please use triton>=3.3.0 to ensure reproducible Triton performance.'
-    assert topk_ids.dim() == 2 and topk_ids.size(1) == 8, "topk_ids should be of Shape[BSZ, 8]"
 
-    E, block_size_M = B.size(0), 16
-    PAGE, device = 1, x.device
-    expert_ids = topk_ids
-    num_tokens_post_padded = torch.empty([layer_info[1], E], dtype=torch.int32, device=device)
-    if layer_info[0] == 0:
-        num_tokens_post_padded.zero_()
-    sorted_token_ids = ops.topk_token_sort(topk_ids, num_tokens_post_padded[layer_info[0]], block_size_M * PAGE)
+    if moe_align_sort_fn is None:
+        try:
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import moe_align_block_size as moe_align_sort_fn
+        except:
+            from external_moe_sorting import moe_align_block_size as moe_align_sort_fn
+
+    block_size_M = 128
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_sort_fn(topk_ids, block_size_M, B.size(0))
     sorted_token_ids.block_size_M = block_size_M
 
-    merged_silu_in = torch.empty([topk_ids.size(0) * (topk_ids.size(1) + 1), B_post.size(1)], device=x.device, dtype=torch.bfloat16)
-
-    if shared_B_bf16 is not None:
-      shared_out = torch.matmul(x, shared_B_bf16.t(), out=merged_silu_in[-topk_ids.size(0):])
-    else:
-      shared_out = None
+    shared_out = torch.matmul(x, shared_B_bf16.t())
+    shared_out = silu_mul(shared_out)
+    shared_out = torch.matmul(shared_out, shared_C_bf16.t())
 
     x, x_scal = ops.to_float8_per_token(x, scale_width)
 
-    config = {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 4, 'num_warps': 2, 'num_stages': 2, 'waves_per_eu': 0} if config_B is None else config_B
-    B_out = moe_one_layer(x, x_scal, B, B.scale_inv, topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, config).flatten(0, 1)
+    config = {'BLOCK_SIZE_M': block_size_M, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_warps': 2, 'num_stages': 1, 'waves_per_eu': 0} if config_B is None else config_B
+    B_out = moe_one_layer(x, x_scal, B, B.scale_inv, topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, config=config).flatten(0, 1)
 
-    config = {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1, 'num_warps': 4, 'num_stages': 1, 'waves_per_eu': 2}
-    B_post_out = moe_one_layer(B_out, B_out, B_post, B_post.scale_inv, topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, config=config, C=merged_silu_in[:-topk_ids.size(0)].view(*topk_ids.shape, -1)).flatten(0, 1)
+    config = {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1, 'num_warps': 4, 'num_stages': 1, 'waves_per_eu': 0}
+    B_post_out = moe_one_layer(B_out, B_out, B_post, B_post.scale_inv, topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, config=config).flatten(0, 1)
 
-    if True:
-        merged_silu_in = silu_mul(merged_silu_in)
-        B_post_act, shared_out = merged_silu_in[:-topk_ids.size(0)], merged_silu_in[-topk_ids.size(0):]
-        config = {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1, 'num_warps': 4, 'num_stages': 1, 'waves_per_eu': 2}
-        C_prev_out = moe_one_layer(B_post_act, B_post_act, C_prev, C_prev.scale_inv, topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, config=config).flatten(0, 1)
+    B_post_act = silu_mul(B_post_out)
 
-        x, x_scal = ops.to_float8_per_token(C_prev_out, scale_width)
+    config = {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1, 'num_warps': 4, 'num_stages': 1, 'waves_per_eu': 0}
+    C_prev_out = moe_one_layer(B_post_act, B_post_act, C_prev, C_prev.scale_inv, topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, config=config).flatten(0, 1)
 
-        config = {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1, 'num_warps': 2, 'num_stages': 1, 'waves_per_eu': 2} if config_C is None else config_C
-        C_out = moe_one_layer(x, x_scal, C, C.scale_inv, topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, config=config).flatten(0, 1)
+    x, x_scal = ops.to_float8_per_token(C_prev_out, scale_width)
 
-        shared_out = torch.matmul(shared_out, shared_C_bf16.t())
-        out = weighted_sum(C_out.view(*topk_ids.shape, -1), topk_weights, shared_out)
+    config = {'BLOCK_SIZE_M': block_size_M, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 4, 'num_warps': 2, 'num_stages': 2, 'waves_per_eu': 2} if config_C is None else config_C
+    C_out = moe_one_layer(x, x_scal, C, C.scale_inv, topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, config=config).flatten(0, 1)
+
+    out = weighted_sum(C_out.view(*topk_ids.shape, -1), topk_weights, shared_out)
     return out
+
