@@ -88,60 +88,25 @@ def fused_moe_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
+    num_PAGE: tl.constexpr,
 ):
-    """
-    Implements the fused computation for a Mixture of Experts (MOE) using
-    token and expert matrices.
+  pid = tl.program_id(axis=0)
+  num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+  num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+  num_pid_in_group = GROUP_SIZE_M * num_pid_n
+  group_id = pid // num_pid_in_group
+  first_pid_m = group_id * GROUP_SIZE_M
+  group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+  pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+  pid_n = (pid % num_pid_in_group) // group_size_m
 
-    Key Parameters:
-    - A: The input tensor representing tokens with shape (*, K), where '*' can
-        be any shape representing batches and K is the feature dimension of
-        each token.
-    - B: The stacked MOE weight tensor with shape (E, N, K), where E is
-        the number of experts, K is the input feature dimension, and N is
-        the output feature dimension.
-    - C: The output cache tensor with shape (M, topk, N), where M is the
-        total number of tokens post padding, topk is the number of times
-        each token is repeated, and N is the output feature dimension.
-    - sorted_token_ids: A tensor containing the sorted indices of tokens,
-        repeated topk times and arranged by the expert index they are
-        assigned to.
-    - expert_ids: A tensor containing the indices of the expert for each
-        block. It determines which expert matrix from B should be used for
-        each block in A.
+  num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + pid_m)
 
-    This kernel performs the multiplication of a token by its corresponding
-    expert matrix as determined by `expert_ids`. The sorting of
-    `sorted_token_ids` by expert index and padding ensures divisibility by
-    BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
-    multiplication across different blocks processed by the same expert.
-    """
-    # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + pid_m)
-    if num_tokens_post_padded == 0: # pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
-    local_offset = tl.arange(0, BLOCK_SIZE_M)
-    offs_token_id = pid_m * BLOCK_SIZE_M + local_offset
+  for PAGE_ID in range(0, tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)):
+    local_offset = tl.arange(0, BLOCK_SIZE_M) + PAGE_ID * BLOCK_SIZE_M
     token_mask = local_offset < num_tokens_post_padded
 
+    offs_token_id = pid_m * (num_PAGE * BLOCK_SIZE_M) + local_offset
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id, mask=token_mask, other=num_valid_tokens).to(tl.int64)
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -276,7 +241,7 @@ def moe_one_layer(A, A_scale, B, B_scale, topk_ids, topk_weights, sorted_token_i
     C = C if C is not None else torch.empty([*topk_ids.shape, B.size(1)], device=A.device, dtype=torch.bfloat16)
 
     padded_size = 0
-    grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),)
+    grid = lambda META: (B.shape[0] * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),)
 
     fused_moe_kernel[grid](
             A,						# torch.Size([3200, 7168])		torch.float8_e4m3fnuz
@@ -290,7 +255,7 @@ def moe_one_layer(A, A_scale, B, B_scale, topk_ids, topk_weights, sorted_token_i
             num_tokens_post_padded,	# tensor([29216], device='cuda:0', dtype=torch.int32)
             B.shape[1],
             B.shape[2] - padded_size,
-            sorted_token_ids.shape[0],
+            B.shape[0] * sorted_token_ids.block_size_M,
             topk_weights.numel(),
             A.stride(0),
             A.stride(1),
@@ -314,6 +279,7 @@ def moe_one_layer(A, A_scale, B, B_scale, topk_ids, topk_weights, sorted_token_i
             use_int8_w8a16=False,
             per_channel_quant=False,
             even_Ks=((B.shape[2] - padded_size) % config["BLOCK_SIZE_K"] == 0),
+            num_PAGE=sorted_token_ids.numel() // (B.shape[0] * sorted_token_ids.block_size_M),
             **config,
         )
     return C
@@ -324,20 +290,21 @@ def silu_mul(x, x_shared=None):
 
 def moe_forward(x, topk_ids, topk_weights, B, B_post, C_prev, C, shared_B_bf16, shared_C_bf16, config_B=None, config_C=None, layer_info=(0, 1), **kwargs):
     bsz = x.numel() // x.size(-1)
-    if bsz > 36:
-        from tutel.ops.moe_forward_policy_3200_shared import moe_forward as moe_forward_fn
-        return moe_forward_fn(x, topk_ids, topk_weights, B, B_post, C_prev, C, shared_B_bf16, shared_C_bf16)
+    # if bsz >= 3200:
+    #     from tutel.ops.moe_forward_policy_3200_shared import moe_forward as moe_forward_fn
+    #     return moe_forward_fn(x, topk_ids, topk_weights, B, B_post, C_prev, C, shared_B_bf16, shared_C_bf16)
 
     # assert triton.__version__ >= '3.3.0', 'Please use triton>=3.3.0 to ensure reproducible Triton performance.'
     assert topk_ids.dim() == 2 and topk_ids.size(1) == 8, "topk_ids should be of Shape[BSZ, 8]"
 
-    E, block_size_M = B.size(0), 16
-    PAGE, device = 1, x.device
+    E = B.size(0)
+    block_size_M = 16 if config_B is None else config_B['BLOCK_SIZE_M']
+    num_PAGE = (x.size(0) + block_size_M - 1) // block_size_M
     expert_ids = topk_ids
-    num_tokens_post_padded = torch.empty([layer_info[1], E], dtype=torch.int32, device=device)
+    num_tokens_post_padded = torch.empty([layer_info[1], E], dtype=torch.int32, device=x.device)
     if layer_info[0] == 0:
         num_tokens_post_padded.zero_()
-    sorted_token_ids = ops.topk_token_sort(topk_ids, num_tokens_post_padded[layer_info[0]], block_size_M * PAGE)
+    sorted_token_ids = ops.topk_token_sort(topk_ids, num_tokens_post_padded[layer_info[0]], block_size_M * num_PAGE)
     sorted_token_ids.block_size_M = block_size_M
 
     merged_silu_in = torch.empty([topk_ids.size(0) * (topk_ids.size(1) + 1), B_post.size(1)], device=x.device, dtype=torch.bfloat16)
