@@ -1387,6 +1387,58 @@ torch::Tensor warp_shared_expert_bf16xf8(
     return xb.view({x.size(0), x.size(1), moe_down_w.size(1)});
 }
 
+torch::Tensor warp_glu_expert_bf16_host_mm(
+  const torch::Tensor &x,
+  const torch::Tensor &expert_ids,
+  const torch::Tensor &expert_weight,
+  const torch::Tensor &gateup_w,
+  const torch::Tensor &down_w,
+  int64_t l
+) {
+  CHECK_EQ(x.dtype(), torch::kBFloat16);
+
+  struct expert_property {
+     void *x_host;
+     unsigned int *exp_id_host;
+     float *exp_ceof_host;
+     size_t x_bytesize;
+     int64_t layer_id;
+
+     torch::Tensor h_gateup, h_down;
+  };
+
+  static expert_property ep[256];
+  CHECK_EQ(l < sizeof(ep) / sizeof(*ep), true);
+
+  if (ep[l].x_host == nullptr) {
+    ep[l].x_bytesize = x.numel() * torch::elementSize(torch::typeMetaToScalarType(x.dtype()));
+    CHECK_EQ(cudaSuccess, cudaMallocHost(&ep[l].exp_id_host, expert_ids.numel() * torch::elementSize(torch::typeMetaToScalarType(expert_ids.dtype()))));
+    CHECK_EQ(cudaSuccess, cudaMallocHost(&ep[l].exp_ceof_host, expert_weight.numel() * torch::elementSize(torch::typeMetaToScalarType(expert_weight.dtype()))));
+    CHECK_EQ(cudaSuccess, cudaMallocHost(&ep[l].x_host, ep[l].x_bytesize));
+    CHECK_NE(ep[l].x_host, nullptr);
+    ep[l].layer_id = l;
+
+    ep[l].h_gateup = gateup_w, ep[l].h_down = down_w;
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  CHECK_EQ(cudaSuccess, cudaMemcpyAsync(ep[l].x_host, x.data_ptr(), ep[l].x_bytesize, cudaMemcpyDeviceToHost, stream));
+  CHECK_EQ(cudaSuccess, cudaMemcpyAsync(ep[l].exp_id_host, expert_ids.data_ptr(), expert_ids.numel() * torch::elementSize(torch::typeMetaToScalarType(expert_ids.dtype())), cudaMemcpyDeviceToHost, stream));
+  CHECK_EQ(cudaSuccess, cudaMemcpyAsync(ep[l].exp_ceof_host, expert_weight.data_ptr(), expert_ids.numel() * torch::elementSize(torch::typeMetaToScalarType(expert_ids.dtype())), cudaMemcpyDeviceToHost, stream));
+  CHECK_EQ(cudaSuccess, cudaLaunchHostFunc(stream, [](void* args) {
+    expert_property *epp = (expert_property *)args;
+    auto t = torch::from_blob(epp->x_host, {1, epp->x_bytesize / 2}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCPU));
+    for (int i = 0; i < 8; ++i) {
+      auto y = torch::matmul(t, epp->h_gateup.select(0, epp->exp_id_host[i]).t());
+      y = at::silu(y.narrow(-1, 0, y.size(-1) / 2)) * y.narrow(-1, y.size(-1) / 2, y.size(-1) / 2) * epp->exp_ceof_host[i];
+      y = torch::matmul(y, epp->h_down.select(0, epp->exp_id_host[i]).t());
+      t.copy_(i ? (y + t) : y);
+    }
+  }, &ep[l]));
+  CHECK_EQ(cudaSuccess, cudaMemcpyAsync(x.data_ptr(), ep[l].x_host, ep[l].x_bytesize, cudaMemcpyHostToDevice, stream));
+  return x;
+}
+
 torch::Tensor warp_glu_expert_bf16xf4_group_scal(
   const torch::Tensor &x,
   const torch::Tensor &expert_ids,
@@ -1571,6 +1623,7 @@ TORCH_LIBRARY(tutel_ops, m) {
   m.def("multi_head_latent_rope_bf16_v3", warp_multi_head_latent_rope_bf16_v3);
   m.def("glu_expert_bf16xf8_block_scal", warp_glu_expert_bf16xf8_block_scal);
   m.def("glu_expert_bf16xf4_group_scal", warp_glu_expert_bf16xf4_group_scal);
+  m.def("glu_expert_bf16_host_mm", warp_glu_expert_bf16_host_mm);
 
   m.def("qwen3_moe_scaled_topk", warp_qwen3_moe_top_8_static);
   m.def("qwen3_norm_rotary_kvcache2_bf16", warp_qwen3_norm_rotary_kvcache2_bf16);
