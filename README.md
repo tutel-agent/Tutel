@@ -5,57 +5,56 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 - Supported Framework: Pytorch (recommend: >= 2.0)
 - Supported GPUs: CUDA(fp64/fp32/fp16/bf16), ROCm(fp64/fp32/fp16/bf16)
 - Supported CPU: fp64/fp32
+- The First to Support DeepSeek 671B NVFP4 Inference using A100/A800/H100/MI300 resources.
+- Fastest "Thinking" on MI300X: Complete a 4K reasoning answer in 39 sec, compared with SGLANG in 1 min 35 sec.
 
-#### - ***The First to Support DeepSeek 671B NVFP4 Inference using A100/A800/H100/MI300 resources.***
-#### - ***Fastest "Thinking" on MI300X: Complete a 4K reasoning answer in 39 sec, compared with SGLANG in 1 min 35 sec.***
-
-#### DeepSeek FP4 Model (upto 2025 Jun): [nvidia/DeepSeek-R1-FP4](https://huggingface.co/nvidia/DeepSeek-R1-FP4)
-> |  ***Machine Type*** | ***TRT-LLM***  | ***SGLANG***  |  ***Tutel***  |
+#### Supported Inference Models: DeepSeek-MoE/Qwen3-MoE/KimiK2-MoE/.. (Decoding TPS, bsz = 1):
+> |  ***Machine Type*** | ***Precision*** | ***SGL***  | ***Tutel***  |
 > |  ----  | ----  | ----  | ----  |
-> | $"A100 \times 8" or "A800 \times 8"$ | N/A | N/A | 85 Generation TPS (bsz = 1) |
-> | $"H100 \times 8" or "H800 \times 8"$ | N/A | N/A | 102 Generation TPS (bsz = 1) |
-> | $MI300 \times 8$  | N/A | N/A | 151 Generation TPS (bsz = 1) |
-> | $MI300 \times 4$ (-e LOCAL\_SIZE=4)  | N/A | N/A | 116 Generation TPS (bsz = 1) |
-
-#### DeepSeek FP8 Model: [DeepSeek-R1-0528](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528) or [DeepSeek-V3-0324](https://huggingface.co/deepseek-ai/DeepSeek-V3-0324) or [DeepSeek-Prover-V2-671B](https://huggingface.co/deepseek-ai/DeepSeek-Prover-V2-671B)
-> |  ***Machine Type*** | ***TRT-LLM***  | ***SGLANG***  |  ***Tutel***  |
-> |  ----  | ----  | ----  | ----  |
-> | $"A100 \times 8" or "H100 \times 8"$ | OoM | OoM | OoM |
-> | $MI300 \times 8$  | N/A | 51 Generation TPS (bsz = 1) | 140 Generation TPS (bsz = 1) |
-
-#### Qwen3/Qwen3MoE Model: [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) or [Qwen/Qwen3-235B-A22B-Instruct-2507-FP8](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8)
-> |  ***Machine Type*** | ***SGL (ctx=64)***  | ***Tutel (ctx=64)***  |  ***SGL (ctx=4096)***  | ***Tutel (ctx=4096)*** |
-> |  ----  | ----  | ----  | ----  | ---- |
-> | $Qwen3-0.6B-BF16 (MI300 \times 1)$ | 667 | 805 | 430 | 553 |
-> | $Qwen3MoE-235B-FP8 (MI300 \times 4)$  | 41 | 99 | 36 | 85 |
-
+> | $nvidia/DeepSeek-R1-FP4\ (671B,\ A100 \times 8)$ | fp4g16 | N/A | 92 |
+> | $nvidia/DeepSeek-R1-FP4\ (671B,\ H100 \times 8)$ | fp4g16 | N/A | 134 |
+> | $nvidia/DeepSeek-R1-FP4\ (671B,\ MI300 \times 8)$ | fp4g16 | N/A | 151 |
+> | $nvidia/DeepSeek-R1-FP4\ (671B,\ MI300 \times 4)$ | fp4g16 | N/A | 116 |
+> | $deepseek-ai/DeepSeek-V3-0324\ (671B,\ MI300 \times 8)$ | fp8b128 | 48 | 145 |
+> | $moonshotai/Kimi-K2-Instruct\ (1T,\ MI300 \times 8)$ | fp8b128 | 49 | 153 |
+> | $moonshotai/Kimi-K2-Instruct\ (1T,\ A100 \times 8)$ | fp4g16 | N/A | 93 |
+> | $Qwen/Qwen3MoE-235B-FP8\ (MI300 \times 4)$ | fp8b128 | 41 |99 |
+> | $Qwen/Qwen3-30B-A3B-FP8\ (A100 \times 1)$ | fp8b128 | N/A | 161 |
+> | $NVFP4/Qwen3-235B-A22B-Instruct-2507-FP4\ (A100 \times 8)$ | fp4g16 | N/A | 96 |
+> | $NVFP4/Qwen3-235B-A22B-Instruct-2507-FP4\ (A100 \times 4)$ | fp4g16 | N/A | 79 |
+> | $NVFP4/Qwen3-235B-A22B-Instruct-2507-FP4\ (MI300 \times 8)$ | fp4g16 | N/A | 122 |
+> | $NVFP4/Qwen3-235B-A22B-Instruct-2507-FP4\ (MI300 \times 4)$ | fp4g16 | N/A | 101 |
+> | $NVFP4/Qwen3-235B-A22B-Instruct-2507-FP4\ (MI300 \times 1)$ | fp4g16 | N/A | 56 |
+> | $Qwen/Qwen3-0.6B\ (MI300 \times 1)$ | bf16 | 667 | 798 |
+> 
 
 > [!TIP]
-> #### Supported Inference Models: Kimi-K2 MoE (1T-param), DeepSeek R1/V3 MoE, Qwen3 MoE:
+> #### News: Image-version *20250801* integrates [OpenWebUI](https://github.com/open-webui/open-webui) by specifying `--serve=webui` ✅
+> 
+> *Steps for "Model Downloading" => "NVIDIA/AMD GPU Serving" => "Browser Login to listen_port":*
 > ```sh
-> >> Example:
-> # Select one model for downloading, e.g.:
+> 
+> # Step-1: Select one model for downloading, e.g.:
 > huggingface-cli download nvidia/DeepSeek-R1-FP4 --local-dir nvidia/DeepSeek-R1-FP4
-> huggingface-cli download Danucore/Qwen3-235B-A22B-Instruct-2507-FP4 --local-dir Danucore/Qwen3-235B-A22B-Instruct-2507-FP4
+> huggingface-cli download NVFP4/Qwen3-235B-A22B-Instruct-2507-FP4 --local-dir NVFP4/Qwen3-235B-A22B-Instruct-2507-FP4
 >
 > huggingface-cli download moonshotai/Kimi-K2-Instruct --local-dir moonshotai/Kimi-K2-Instruct
 > huggingface-cli download Qwen/Qwen3-30B-A3B-FP8 --local-dir Qwen/Qwen3-30B-A3B-FP8
 > huggingface-cli download Qwen/Qwen3-0.6B --local-dir Qwen/Qwen3-0.6B
 > huggingface-cli download nvidia/DeepSeek-R1-FP4 --local-dir nvidia/DeepSeek-R1-FP4
 >
-> # For A100/A800/H100/H800/H20/H200 (80G x 8):
-> docker run -it --rm --ipc=host --net=host --shm-size=8g --ulimit memlock=-1 \
->       --ulimit stack=67108864 --gpus=all -v /:/host -w /host$(pwd) \
->       tutelgroup/deepseek-671b:a100x8-chat-20250723 \
+> # Step-2(a): For NVIDIA A100/A800/H100/H800/H20/H200 (80G x 8):
+> docker run -e LOCAL_SIZE=8 -it --rm --ipc=host --net=host --shm-size=8g \
+>       --ulimit memlock=-1 --ulimit stack=67108864 --gpus=all -v /:/host -w /host$(pwd) \
+>       tutelgroup/deepseek-671b:a100x8-chat-20250801 --serve=webui --listen_port 8000 \
 >         --prompt "Calculate the indefinite integral of 1/sin(x) + x" \
->         --serve --listen_port 8000 \
 >         --try_path ./moonshotai/Kimi-K2-Instruct \
 >         --try_path ./deepseek-ai/DeepSeek-R1-0528 \
 >         --try_path ./nvidia/DeepSeek-R1-FP4 \
 >         --try_path ./deepseek-ai/DeepSeek-R1 \
 >         --try_path ./deepseek-ai/DeepSeek-V3-0324 \
 >         --try_path ./deepseek-ai/DeepSeek-Prover-V2-671B \
->         --try_path ./Danucore/Qwen3-235B-A22B-Instruct-2507-FP4 \
+>         --try_path ./NVFP4/Qwen3-235B-A22B-Instruct-2507-FP4 \
 >         --try_path ./Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
 >         --try_path ./Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
 >         --try_path ./Qwen/Qwen3-30B-A3B-FP8 \
@@ -63,30 +62,31 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >         --try_path ./Qwen/Qwen3-32B \
 >         --try_path ./Qwen/Qwen3-0.6B
 >
-> # For AMD MI300x NVFP4/FP8 (192G x 8):
-> docker run -it --rm --ipc=host --net=host --shm-size=8g --ulimit memlock=-1 \
->       --ulimit stack=67108864 --device=/dev/kfd --device=/dev/dri --group-add=video \
+> # Step-2(b): For AMD MI300x NVFP4/FP8 (192G x 8):
+> docker run -e LOCAL_SIZE=8 -it --rm --ipc=host --net=host --shm-size=8g \
+>       --ulimit memlock=-1 --ulimit stack=67108864 --device=/dev/kfd --device=/dev/dri --group-add=video \
 >       --cap-add=SYS_PTRACE --security-opt seccomp=unconfined -v /:/host -w /host$(pwd) \
->       tutelgroup/deepseek-671b:mi300x8-chat-20250723 \
+>       tutelgroup/deepseek-671b:mi300x8-chat-20250801 --serve=webui --listen_port 8000 \
 >         --prompt "Calculate the indefinite integral of 1/sin(x) + x" \
->         --serve --listen_port 8000 \
 >         --try_path ./moonshotai/Kimi-K2-Instruct \
 >         --try_path ./deepseek-ai/DeepSeek-R1-0528 \
 >         --try_path ./nvidia/DeepSeek-R1-FP4 \
 >         --try_path ./deepseek-ai/DeepSeek-R1 \
 >         --try_path ./deepseek-ai/DeepSeek-V3-0324 \
 >         --try_path ./deepseek-ai/DeepSeek-Prover-V2-671B \
->         --try_path ./Danucore/Qwen3-235B-A22B-Instruct-2507-FP4 \
+>         --try_path ./NVFP4/Qwen3-235B-A22B-Instruct-2507-FP4 \
 >         --try_path ./Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
 >         --try_path ./Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
 >         --try_path ./Qwen/Qwen3-30B-A3B-FP8 \
 >         --try_path ./Qwen/Qwen3-32B-FP8 \
 >         --try_path ./Qwen/Qwen3-32B \
 >         --try_path ./Qwen/Qwen3-0.6B
+>
+> # Step-3: Open Open-WebUI from Browsers (Edge/Chromium/Firefox/..):
+>     x-www-browser http://0.0.0.0:8000/
 > ```
 
-#### More Versions can be found [here](https://hub.docker.com/r/tutelgroup/deepseek-671b)
-
+#### More image versions can be found [here](https://hub.docker.com/r/tutelgroup/deepseek-671b/tags)
 
 ## What's New:
 
