@@ -11,6 +11,7 @@ from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
 
 from tutel import system, net, moe
+import autort
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -84,7 +85,7 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     train_seq_len = 1024 # FlexAttention sequence length
-    val_seq_len = 1024 # FlexAttention sequence length for validation
+    val_seq_len = train_seq_len # FlexAttention sequence length for validation
     # optimization
     num_iterations = 1750 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
@@ -114,68 +115,18 @@ print0("="*100)
 
 from modeling import get_model
 model = get_model()
-for m in model.modules():
-    if isinstance(m, nn.Embedding):
-        m.bfloat16()
 
 for name, param in model.named_parameters():
     param.param_name = name
     if not hasattr(param, 'expert'):
         net.simple_broadcast(param.detach(), 0)
 
+# optimizers = [torch.optim.Adam(model.parameters(), lr=0.008)]
+from rmsprop import RMSprop
+optimizers = [RMSprop(model.parameters(), lr=0.008)]
 
-optimizers = [torch.optim.Adam(model.parameters(), lr=0.008)]
-for opt in optimizers:
-    for group in opt.param_groups:
-        group["initial_lr"] = group["lr"]
+# model: nn.Module = torch.compile(model, dynamic=False)
 
-# learning rate schedule: stable then decay
-def get_lr(step: int):
-    x = step / args.num_iterations # progress in training
-    assert 0 <= x < 1
-    if x < 1 - args.cooldown_frac:
-        return 1.0
-    else:
-        w = (1 - x) / args.cooldown_frac
-        return w * 1.0 + (1 - w) * 0.1
-
-# attention window size schedule: linearly increase
-@lru_cache(1)
-def get_window_size_blocks_helper(window_size: int):
-    return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-def next_multiple_of_n(v: float | int, *, n: int):
-    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
-def get_window_size_blocks(step: int):
-    x = step / args.num_iterations # progress in training
-    assert 0 <= x <= 1
-    # Linearly increase the block-wise sliding window size over training 128 -> 1792
-    window_size = next_multiple_of_n(1728 * x, n=128)
-    return get_window_size_blocks_helper(window_size)
-
-model: nn.Module = torch.compile(model, dynamic=False)
-
-
-########################################
-#            Warmup kernels            #
-########################################
-
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 10
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=False)
-for _ in range(warmup_steps):
-    inputs, targets = next(train_loader)
-    model.zero_grad(set_to_none=True)
-    loss = model(inputs, targets) # , get_window_size_blocks(1))
-    (loss + args.balancing_importance * getattr(loss, 'l_aux', 0)).backward()
-    for opt in optimizers:
-        opt.step()
-
-model.load_state_dict(initial_state["model"])
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-    opt.load_state_dict(opt_state)
-del train_loader, initial_state
 
 ########################################
 #        Training and validation       #
@@ -192,7 +143,7 @@ for step in range(train_steps + 1):
     last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------
-    if (last_step or (step > 0 and step % args.val_loss_every == 0)):
+    if False and (last_step or (step > 0 and step % args.val_loss_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms = 1000 * (time.perf_counter() - t0)
@@ -205,7 +156,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                val_loss_step = model(inputs, targets) # , get_window_size_blocks(step))
+                val_loss_step = model(inputs, targets)
                 val_loss += val_loss_step
                 val_l_aux += getattr(val_loss_step, 'l_aux', 0)
         val_loss /= val_steps
@@ -228,6 +179,7 @@ for step in range(train_steps + 1):
         # the last step only has the validation loop, so break to avoid training
         break
 
+    train_start = autort.wait()
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
 
@@ -239,14 +191,14 @@ for step in range(train_steps + 1):
  
     def CHECK_STATES(name, p_scanner_fn, weak_match=False):
         print0(f'[DEBUG({name})] Validating all parameters are in proper states..')
-
-        for opt in optimizers:
+        with torch.no_grad():
+          for opt in optimizers:
             for group in opt.param_groups:
                 for param in group["params"]:
                     p = p_scanner_fn(param)
                     if p is None:
                         continue
-                    v_validate = net.all_gather(p.float().sum().flatten(), 0)
+                    v_validate = net.all_gather(p.sum().flatten(), 0)
                     all_matched = (v_validate == v_validate[0]).all()
                     if (all_matched and not weak_match and hasattr(param, 'expert')) or (not all_matched and not hasattr(param, 'expert')):
                          print0(v_validate)
@@ -262,7 +214,7 @@ for step in range(train_steps + 1):
     CHECK_STATES('weights-init', lambda p: p)
 
     model.zero_grad(set_to_none=True)
-    loss = model(inputs, targets) # , get_window_size_blocks(step))
+    loss = model(inputs, targets)
     (loss + args.balancing_importance * getattr(loss, 'l_aux', 0)).backward()
     param_scanner(lambda p: net.simple_all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG, inplace=True) if getattr(p, 'grad', None) is not None and not hasattr(param, 'expert') else None)
 
@@ -272,10 +224,11 @@ for step in range(train_steps + 1):
         opt.step()
 
     CHECK_STATES('weights-upd', lambda p: p)
+    train_stop = autort.wait()
 
     # logging
-    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} loss:{loss.item()} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms")
+    approx_training_time_ms = (train_stop - train_start) * 1000
+    print0(f"step:{step+1}/{train_steps} loss:{loss.item()} train_time:{approx_training_time_ms:.2f}ms")
 
 print0(f"peak memory allocated per-device: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")

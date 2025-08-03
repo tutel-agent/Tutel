@@ -22,9 +22,13 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from rmsprop import apply_gradient
+
 # -----------------------------------------------------------------------------
 
 class ManagedGemm(torch.autograd.Function):
+    lr = 0.008
+
     @staticmethod
     def forward(ctx, x, y):
         z = x @ y.t()
@@ -62,7 +66,7 @@ class Qwen3(torch.nn.Module):
         self.q_head_dim = config['num_attention_heads']
         self.kv_head_dim = config['num_key_value_heads']
 
-        self.token_emb = param(load('model.embed_tokens.weight'), False)
+        self.token_emb = param(load('model.embed_tokens.weight'))
         self.lm_head = param(load('lm_head.weight'))
 
         self.rms_att_w = param(torch.cat([
@@ -107,6 +111,7 @@ class Qwen3(torch.nn.Module):
 
     def gemm(self, x, y, out=None):
         return torch.matmul(x, y.t(), out=out)
+        # return ManagedGemm.call(x, y)
 
     def rms_norm(self, x, weight, eps=1e-6):
         input_dtype = x.dtype
@@ -225,10 +230,6 @@ class Qwen3(torch.nn.Module):
         # q_states.register_hook(fn)
         # v_states.register_hook(fn)
         return q_states, k_states, v_states
-
-    def gemm(self, x, y):
-        return x @ y.t()
-        # return ManagedGemm.call(xb, self.qkv_proj[l])
 
     def forward(self, token_in, target_seq, offset=0, out=None):
         token_in = token_in.view(1, -1)
