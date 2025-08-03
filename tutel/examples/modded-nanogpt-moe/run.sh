@@ -8,6 +8,6 @@ else
 	PYTHON=python
 fi
 
-[ -e data/fineweb10B/fineweb_val_000000.bin ] || $PYTHON data/cached_fineweb10B.py 8
+[ -e data/fineweb10B/fineweb_val_000000.bin ] || $PYTHON data/cached_fineweb10B.py 1
 
-torchrun --standalone --nproc_per_node=8 ./train_gpt_v0.py
+python3 ./train_gpt_v0.py

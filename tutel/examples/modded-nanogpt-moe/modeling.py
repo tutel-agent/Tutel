@@ -6,6 +6,7 @@ import uuid
 import time
 import copy
 import glob
+import json
 from dataclasses import dataclass
 from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
@@ -16,186 +17,270 @@ use_moe = int(os.environ.get("USE_MOE", 1))
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 
 from torch import Tensor, nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the model
 
-def norm(x: Tensor):
-    return F.rms_norm(x, (x.size(-1),))
+class ManagedGemm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, y):
+        z = x @ y.t()
+        ctx.save_for_backward(x, y)
+        if hasattr(ManagedGemm, 'lr'):
+           ctx.lr = ManagedGemm.lr
+        return z
 
-class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
-        super().__init__(in_features, out_features, bias=False)
-        self.use_fp8 = use_fp8
-        self.x_s = x_s
-        self.w_s = w_s
-        self.grad_s = grad_s
+    @staticmethod
+    def backward(ctx, dz):
+        x, y = ctx.saved_tensors
+        dx = dz @ y
+        dy = dz.view(-1, dz.size(-1)).t() @ x.view(-1, x.size(-1))
+        dy, _ = None, apply_gradient(y, y.state, dy, group={"lr": ctx.lr})
+        return (dx, dy,)
 
-    def reset_parameters(self) -> None:
-        std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
-        bound = (3 ** 0.5) * std
-        with torch.no_grad():
-            self.weight.uniform_(-bound, bound)
-
-    def forward(self, x: Tensor):
-        return F.linear(x, self.weight.type_as(x))
-
-class Rotary(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int):
-        super().__init__()
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        theta = torch.einsum("i,j -> ij", t, angular_freq)
-        self.cos = nn.Buffer(theta.cos(), persistent=False)
-        self.sin = nn.Buffer(theta.sin(), persistent=False)
-
-    def forward(self, x_BTHD: Tensor):
-        assert self.cos.size(0) >= x_BTHD.size(-3)
-        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
-        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
-        y1 = x1 * cos + x2 * sin
-        y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x_BTHD)
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        hdim = num_heads * head_dim
-        std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std
-        self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
-        self.rotary = Rotary(head_dim, max_seq_len)
-        self.c_proj = CastedLinear(hdim, dim)
-        self.attn_scale = 0.12
-
-    def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor):
-        B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k)
-        q, k = self.rotary(q), self.rotary(k)
-        if ve is not None:
-            v = lambdas[0] * v + lambdas[1] * ve.view_as(v)
+    @staticmethod
+    def call(x, y, naive=False):
+        if naive or not hasattr(y, 'state'):
+           return x @ y.t()
         else:
-            v = lambdas[0] * v
-        y = torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, scale=self.attn_scale).transpose(1, 2)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
-        return y
+           return ManagedGemm.apply(x, y)
 
-class MLP(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        hdim = 4 * dim
-        self.c_fc = CastedLinear(dim, hdim)
-        self.c_proj = CastedLinear(hdim, dim)
+device = "cuda"
+batch_size, max_length = 1, 4096
 
-    def forward(self, x: Tensor):
-        x = self.c_fc(x)
-        x = F.silu(x)
-        x = self.c_proj(x)
-        x.l_aux = 0.0
+class Qwen3(torch.nn.Module):
+    def __init__(self, state_dict, config):
+        super(Qwen3, self).__init__()
+        load = lambda key: state_dict[key]
+        param = lambda t, trainable=True: torch.nn.Parameter(t.to(device)) if trainable else t.to(device)
+
+        self.n_layers = int(os.environ.get('LAYER', config['num_hidden_layers']))
+        self.head_dim = config['head_dim']
+        self.q_head_dim = config['num_attention_heads']
+        self.kv_head_dim = config['num_key_value_heads']
+
+        self.token_emb = param(load('model.embed_tokens.weight'), False)
+        self.lm_head = param(load('lm_head.weight'))
+
+        self.rms_att_w = param(torch.cat([
+            load(f'model.layers.{l}.input_layernorm.weight').unsqueeze(0) for l in range(self.n_layers)
+        ] + [load('model.norm.weight').unsqueeze(0),]))
+
+        self.rms_ffn_w = param(torch.cat([load(f'model.layers.{l}.post_attention_layernorm.weight').unsqueeze(0) for l in range(self.n_layers)]))
+
+        self.qk_norm = param(torch.cat([torch.cat([
+            load(f'model.layers.{l}.self_attn.q_norm.weight').unsqueeze(0),
+            load(f'model.layers.{l}.self_attn.k_norm.weight').unsqueeze(0),
+        ]).unsqueeze(0) for l in range(self.n_layers)]))
+
+        self.qkv_proj = torch.nn.ParameterList([param(torch.cat([
+            load(f'model.layers.{l}.self_attn.q_proj.weight'),
+            load(f'model.layers.{l}.self_attn.k_proj.weight'),
+            load(f'model.layers.{l}.self_attn.v_proj.weight'),
+        ])) for l in range(self.n_layers)])
+
+        self.o_proj = torch.nn.ParameterList([param(load(f'model.layers.{l}.self_attn.o_proj.weight')) for l in range(self.n_layers)])
+
+        self.gate_up_p = torch.nn.ParameterList([param(torch.cat([
+            load(f'model.layers.{l}.mlp.gate_proj.weight'),
+            load(f'model.layers.{l}.mlp.up_proj.weight'),
+        ]).unsqueeze(0)) for l in range(self.n_layers)])
+
+        self.down_p = torch.nn.ParameterList([param(torch.cat([
+            load(f'model.layers.{l}.mlp.down_proj.weight'),
+        ]).unsqueeze(0)) for l in range(self.n_layers)])
+
+        freqs = 1 / (config['rope_theta'] ** (torch.arange(0, self.head_dim // 2, device=device) / (self.head_dim / 2.0))).flatten()
+        self.freq_emb = torch.cat((freqs, freqs), dim=-1)
+        self.kv_cache = torch.zeros([2, self.n_layers, batch_size, max_length, self.kv_head_dim, self.head_dim], dtype=self.qkv_proj[0].dtype, device=self.qkv_proj[0].device)
+
+        '''
+        self.down_p_lorank_a = param(torch.rand(self.n_layers, 1, 32, 3072, dtype=self.down_p.dtype, device=self.down_p.device) / math.sqrt(3072))
+        self.down_p_lorank_b = param(torch.rand(self.n_layers, 1, 1024, 32, dtype=self.down_p.dtype, device=self.down_p.device) / math.sqrt(32))
+        with torch.no_grad():
+            V = (self.down_p_lorank_b @ self.down_p_lorank_a)
+            self.down_p.copy_(self.down_p - V) '''
+
+
+    def gemm(self, x, y, out=None):
+        return torch.matmul(x, y.t(), out=out)
+
+    def rms_norm(self, x, weight, eps=1e-6):
+        input_dtype = x.dtype
+        x = x.float()
+        variance = (x * x).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + eps)
+        return weight * x.to(input_dtype)
+
+    def add_norm(self, x, xb, weight, eps=1e-6):
+        x = x + xb
+        return x, self.rms_norm(x, weight, eps)
+
+    def apply_rotary_pos_emb(self, q, k, position_ids):
+        def rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        emb = position_ids.to(self.freq_emb.dtype) @ self.freq_emb.view(1, -1)
+        cos, sin = emb.cos().to(q.dtype), emb.sin().to(k.dtype)
+        cos = cos.view(*q.shape[:-2], -1, q.size(-1))
+        sin = sin.view(*q.shape[:-2], -1, q.size(-1))
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    def attn(self, q, k_buffer, v_buffer, sm_scale, layer_id, offset):
+        # return torch.nn.functional.scaled_dot_product_attention(q_states.transpose(1, 2), k_states.transpose(1, 2), v_states.transpose(1, 2), scale=1 / math.sqrt(self.head_dim), enable_gqa=True, is_causal=True).transpose(1, 2)
+
+        def fn(grad):
+            print(grad.shape, grad.reshape(grad.size(1), -1).sum(-1)); exit(0)
+            return grad
+
+        def fn_noexit(grad):
+            print(grad.shape, grad.reshape(grad.size(1), -1).sum(-1))
+            return grad
+
+        # q.register_hook(fn)
+        SI, S = q.size(1), k_buffer.size(1)
+        # 内存占用变大
+        temp_mask = torch.ones(SI, S, dtype=torch.bool, device=q.device).tril(diagonal=0)
+        attn_bias = torch.zeros(SI, S, dtype=q.dtype, device=q.device). \
+            masked_fill_(temp_mask.logical_not(), float("-inf"))
+
+        ''' if L == 0 and R == 32:
+            torch.save(k_buffer.detach(), f'cache/k_in_{layer_id}.pt')
+            torch.save(v_buffer.detach(), f'cache/v_in_{layer_id}.pt')
+            k_buffer.register_hook(fn)
+        elif L == 32 and R == 64:
+            k_in = torch.load(f'cache/k_in_{layer_id}.pt').requires_grad_()
+            v_in = torch.load(f'cache/v_in_{layer_id}.pt').requires_grad_()
+            attn_bias = torch.cat([torch.zeros_like(attn_bias), attn_bias], dim=-1)
+
+            k_buffer.register_hook(fn)  # 分散的一部分grad （除去v_in）
+            k_in.register_hook(fn_noexit)
+
+            k_buffer = torch.cat([k_in, k_buffer], dim=1)
+            v_buffer = torch.cat([v_in, v_buffer], dim=1)
+
+            k_buffer.register_hook(fn_noexit)
+        else:
+            k_buffer.register_hook(fn) '''
+
+        if not q.requires_grad:
+            self.kv_cache[0, layer_id, :, offset:offset + k_buffer.size(1)] = k_buffer
+            self.kv_cache[1, layer_id, :, offset:offset + k_buffer.size(1)] = v_buffer
+
+        k_buffer = torch.cat([self.kv_cache[0, layer_id, :, :offset], k_buffer], dim=1)
+        v_buffer = torch.cat([self.kv_cache[1, layer_id, :, :offset], v_buffer], dim=1)
+        attn_bias = torch.cat([torch.zeros([SI, offset], dtype=attn_bias.dtype, device=attn_bias.device), attn_bias], dim=-1)
+
+        qk = torch.einsum('bthHm,bshm->bthHs', [
+            q.view(q.size(0), q.size(1), k_buffer.size(2), -1, q.size(-1)), k_buffer])
+        qk = torch.softmax(qk * sm_scale + attn_bias.view(1, SI, 1, 1, -1), dim=-1)
+
+        o = torch.einsum('bthHs,bshm->bthHm', [qk, v_buffer]).reshape(q.size())
+        # o.register_hook(fn)
+        return o
+
+    def glu_ffn(self, x, layer_id):
+        gate_up, down = self.gate_up_p[layer_id][0], self.down_p[layer_id][0]
+
+        x = (x @ gate_up.t())
+        x = torch.nn.functional.silu(x.narrow(-1, 0, x.size(-1) // 2)) * x.narrow(-1, x.size(-1) // 2, x.size(-1) // 2)
+
+        if hasattr(self, 'down_p_lorank_a'):
+            x = (x @ down.t()) + (x @ self.down_p_lorank_a[layer_id][0].t()) @ self.down_p_lorank_b[layer_id][0].t()
+        else:
+            x = x @ down.t()
         return x
 
-class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
-        super().__init__()
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        if use_moe == 0:
-            self.mlp = MLP(dim)
-        else:
-            self.mlp = moe.moe_layer(
-                model_dim=dim,
-                gate_type={'type': 'top', 'k': 1, 'capacity_factor': 1.1, 'fp32_gate': False},
-                experts={'num_experts_per_device': 1, 'type': 'ffn', 'hidden_size_per_expert': 4 * dim, 'activation_fn': F.silu, 'has_fc1_bias': False, 'has_fc2_bias': False},
-                scan_expert_func = lambda name, param: setattr(param, 'expert', True),
-            ).bfloat16()
+    def rotary_emb(self, qkv_out, layer_id, offset):
+        b, s, l = qkv_out.size(0), qkv_out.size(1), layer_id
+        q_states, k_states, v_states = \
+            self.rms_norm(qkv_out.narrow(-2, 0, self.q_head_dim), self.qk_norm[l][0]), \
+            self.rms_norm(qkv_out.narrow(-2, self.q_head_dim, self.kv_head_dim), self.qk_norm[l][1]), \
+            qkv_out.narrow(-2, self.q_head_dim + self.kv_head_dim, self.kv_head_dim)
 
-    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor):
-        x = lambdas[0] * x + lambdas[1] * x0
-        if self.attn is not None:
-            x = x + self.attn(norm(x), ve, sa_lambdas)
-        ffn_out = self.mlp(norm(x))
-        x = x + ffn_out
-        return x, ffn_out.l_aux
+        def rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
 
-# -----------------------------------------------------------------------------
-# The main model
+        def apply_rotary_pos_emb(q, k, freq_emb, position_ids):
+            emb = position_ids.to(freq_emb.dtype) @ freq_emb.view(1, -1)
+            cos, sin = emb.cos().to(q.dtype), emb.sin().to(k.dtype)
+            cos = cos.view(*q.shape[:-2], -1, q.size(-1))
+            sin = sin.view(*q.shape[:-2], -1, q.size(-1))
+            q_embed = (q * cos) + (rotate_half(q) * sin)
+            k_embed = (k * cos) + (rotate_half(k) * sin)
+            return q_embed, k_embed
 
-def next_multiple_of_n(v: float | int, *, n: int):
-    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+        position_ids = (torch.arange(0, b * s, dtype=torch.int32, device=qkv_out.device) % s).view(b, s, 1) + offset
+        q_states, k_states = apply_rotary_pos_emb(q_states, k_states, self.freq_emb, position_ids)
 
-class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
-        super().__init__()
-        vocab_size = next_multiple_of_n(vocab_size, n=128)
-        self.embed = nn.Embedding(vocab_size, model_dim)
-        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=False, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
-        # Add learnable skip connection weights for decoder layers
-        assert num_layers % 2 == 0
-        pad = (-num_layers * 5) % net.get_world_size()
-        self.scalars = nn.Parameter(torch.cat([
-            torch.ones(num_layers), # skip_weights
-            *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)], # block lambdas
-            *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
-            torch.ones(pad),
-        ]))
-        # set learning rates
-        for param in self.embed.parameters():
-            param.lr_mul = 75.
-        for param in self.value_embeds.parameters():
-            param.lr_mul = 75.
-        self.lm_head.weight.lr_mul = 27.5
-        self.scalars.lr_mul = 5.0
+        # q_states.register_hook(fn)
+        # v_states.register_hook(fn)
+        return q_states, k_states, v_states
 
+    def gemm(self, x, y):
+        return x @ y.t()
+        # return ManagedGemm.call(xb, self.qkv_proj[l])
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
-        assert input_seq.ndim == 1
+    def forward(self, token_in, target_seq, offset=0, out=None):
+        token_in = token_in.view(1, -1)
+        x = self.token_emb.index_select(0, token_in.flatten()).view(*token_in.shape, self.token_emb.size(-1))
+        xb = self.rms_norm(x, self.rms_att_w[0])
+        # xb.register_hook(fn)
 
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
-        assert len(ve) == len(self.blocks)
+        for l in range(self.n_layers):
+            qkv_out = self.gemm(xb, self.qkv_proj[l]).view(x.size(0), x.size(1), -1, self.head_dim)
 
-        x = x0 = norm(self.embed(input_seq)[None])
+            # q_states, k_states, v_states = self.rotary_emb(qkv_out, l, offset)
+            q_states, k_states, v_states = checkpoint(self.rotary_emb, qkv_out, l, offset, use_reentrant=True)
 
-        skip_connections = []
-        skip_weights = self.scalars[:(len(self.blocks) // 2)]
-        lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
-        sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
+            import math
+            scores = self.attn(q_states, k_states, v_states, sm_scale=1 / math.sqrt(self.head_dim), layer_id=l, offset=offset)
+            xb = self.gemm(scores.flatten(-2), self.o_proj[l])
 
-        n = len(self.blocks) // 2
+            x, xb = self.add_norm(x, xb, self.rms_ffn_w[l])
+            xb = self.glu_ffn(xb, l)
+            x, xb = self.add_norm(x, xb, self.rms_att_w[l + 1])
 
-        l_aux = None
-        for i in range(len(self.blocks)):
-            if i >= n:
-                x = x + skip_weights[i - n] * skip_connections.pop()
-            x, l_aux_block = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i])
-            if i < n:
-                skip_connections.append(x)
-            l_aux = l_aux_block if l_aux is None else (l_aux_block + l_aux)
+        out = self.gemm(xb, self.lm_head)
+        # out.register_hook(fn)
+        # return out
 
-        x = norm(x)
-        logits = self.lm_head(x).float()
-        logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
-        loss.l_aux = l_aux
+        logits = out.view(-1, out.size(-1))
+        log_probs = F.log_softmax(logits, dim=1)
+        true_class_log_probs = log_probs.gather(1, target_seq.unsqueeze(1)).squeeze(1)
+        loss = -torch.mean(true_class_log_probs)
+        # loss2 = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq) # , reduction="sum" if self.training else "mean")
+        # loss.l_aux = 0.0
         return loss
 
-# -----------------------------------------------------------------------------
-# int main
-
 def get_model():
-    num_heads: int = 16
-    max_seq_len: int = 4096
-    model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=num_heads, model_dim=(num_heads * 128), max_seq_len=max_seq_len).cuda()
-    return model
+    # 加载模型参数
+    try:
+        model_path = f'Qwen/Qwen3-0.6B'
 
+        from safetensors.torch import safe_open, save_file
+        state_dict = {}
+        for f in os.listdir(model_path):
+          if f.endswith('.safetensors'):
+            with safe_open(f'{model_path}/{f}', framework='pt') as f:
+              for k in f.keys():
+                 state_dict[k] = f.get_tensor(k)
+
+        with open(f'{model_path}/config.json', 'r') as fp:
+          config = json.loads(fp.read())
+
+    except Exception as e:
+        print(f"Failed to load model from {model_path}: {e}")
+        raise
+
+    graph = Qwen3(state_dict, config).to(device)
+    return graph

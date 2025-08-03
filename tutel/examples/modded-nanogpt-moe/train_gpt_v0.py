@@ -12,8 +12,6 @@ from pathlib import Path
 
 from tutel import system, net, moe
 
-use_moe = int(os.environ.get("USE_MOE", 1))
-
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
@@ -101,7 +99,7 @@ assert torch.cuda.is_available()
 parallel_env = system.init_data_model_parallel(group_count=1, backend='nccl')
 rank = parallel_env.global_rank
 world_size = parallel_env.global_size
-assert world_size == 8, "This example is designed for A100/H100/MI300 x 8."
+
 device = parallel_env.local_device
 torch.cuda.set_device(device)
 master_process = (rank == 0)
@@ -125,11 +123,6 @@ for name, param in model.named_parameters():
     if not hasattr(param, 'expert'):
         net.simple_broadcast(param.detach(), 0)
 
-# collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params = [model.lm_head.weight]
 
 optimizers = [torch.optim.Adam(model.parameters(), lr=0.008)]
 for opt in optimizers:
@@ -174,10 +167,11 @@ train_loader = distributed_data_generator(args.train_files, world_size * args.tr
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model.zero_grad(set_to_none=True)
-    loss = model(inputs, targets, get_window_size_blocks(1))
-    (loss + args.balancing_importance * loss.l_aux).backward()
+    loss = model(inputs, targets) # , get_window_size_blocks(1))
+    (loss + args.balancing_importance * getattr(loss, 'l_aux', 0)).backward()
     for opt in optimizers:
         opt.step()
+
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
@@ -198,7 +192,7 @@ for step in range(train_steps + 1):
     last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+    if (last_step or (step > 0 and step % args.val_loss_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms = 1000 * (time.perf_counter() - t0)
@@ -211,15 +205,15 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                val_loss_step = model(inputs, targets, get_window_size_blocks(step))
+                val_loss_step = model(inputs, targets) # , get_window_size_blocks(step))
                 val_loss += val_loss_step
-                val_l_aux += val_loss_step.l_aux
+                val_l_aux += getattr(val_loss_step, 'l_aux', 0)
         val_loss /= val_steps
-        val_l_aux /= val_steps * len(model.blocks)
+        val_l_aux /= val_steps
         del val_loader
-        net.simple_all_reduce(val_loss, op=torch.distributed.ReduceOp.AVG, inplace=True)
-        if isinstance(val_l_aux, torch.Tensor):
-            net.simple_all_reduce(val_l_aux, op=torch.distributed.ReduceOp.AVG, inplace=True)
+        # net.simple_all_reduce(val_loss, op=torch.distributed.ReduceOp.AVG, inplace=True)
+        # if isinstance(val_l_aux, torch.Tensor):
+        #     net.simple_all_reduce(val_l_aux, op=torch.distributed.ReduceOp.AVG, inplace=True)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} val_balance_loss:{val_l_aux:.4f} step_time:{training_time_ms/args.val_loss_every:.2f}ms")
         model.train()
         # start the clock again
@@ -268,8 +262,8 @@ for step in range(train_steps + 1):
     CHECK_STATES('weights-init', lambda p: p)
 
     model.zero_grad(set_to_none=True)
-    loss = model(inputs, targets, get_window_size_blocks(step))
-    (loss + args.balancing_importance * loss.l_aux).backward()
+    loss = model(inputs, targets) # , get_window_size_blocks(step))
+    (loss + args.balancing_importance * getattr(loss, 'l_aux', 0)).backward()
     param_scanner(lambda p: net.simple_all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG, inplace=True) if getattr(p, 'grad', None) is not None and not hasattr(param, 'expert') else None)
 
     CHECK_STATES('gradients', lambda p: p.grad if hasattr(p, 'grad') else None, weak_match=True)
@@ -281,7 +275,7 @@ for step in range(train_steps + 1):
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    # print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms")
+    print0(f"step:{step+1}/{train_steps} loss:{loss.item()} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms")
 
 print0(f"peak memory allocated per-device: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
