@@ -17,9 +17,16 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 
+torch.manual_seed(0)
+import random
+random.seed(0)
+import numpy as np
+np.random.seed(0)
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+torch.use_deterministic_algorithms(True)
+
 from torch import Tensor, nn
 import torch.nn.functional as F
-
 
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -207,14 +214,20 @@ for step in range(train_steps + 1):
 
         print0(f'[DEBUG({name})] Validation passed. ✅')
 
-    if step > 10:
+    if step >= 0:
         # Disable CHECK_STATES for the following steps
         CHECK_STATES = lambda *args, **kwargs: None
 
     CHECK_STATES('weights-init', lambda p: p)
 
+    step_tokens = inputs.numel()
+    blockSize = 256
+    blockSize = blockSize if blockSize > 0 else step_tokens
+
     model.zero_grad(set_to_none=True)
     loss = model(inputs, targets)
+    loss = loss.view(-1, blockSize).sum(-1).sum() / step_tokens
+
     (loss + args.balancing_importance * getattr(loss, 'l_aux', 0)).backward()
     param_scanner(lambda p: net.simple_all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG, inplace=True) if getattr(p, 'grad', None) is not None and not hasattr(param, 'expert') else None)
 

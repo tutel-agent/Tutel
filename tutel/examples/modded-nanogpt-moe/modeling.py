@@ -258,6 +258,8 @@ class Qwen3(torch.nn.Module):
         logits = out.view(-1, out.size(-1))
         log_probs = F.log_softmax(logits, dim=1)
         true_class_log_probs = log_probs.gather(1, target_seq.unsqueeze(1)).squeeze(1)
+        return -true_class_log_probs
+
         loss = -torch.mean(true_class_log_probs)
         # loss2 = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq) # , reduction="sum" if self.training else "mean")
         # loss.l_aux = 0.0
