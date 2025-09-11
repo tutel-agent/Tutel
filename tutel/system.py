@@ -103,7 +103,12 @@ def perform(fn, num_runs=100):
 def from_url(link, path=None):
   import requests
   import tempfile
-  file_name = path or tempfile.mktemp()
+  if path is not None:
+    file_name = path
+  else:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".download")
+    file_name = tmp.name
+    tmp.close()
 
   if not os.path.exists(file_name) and link is not None:
     dirname = os.path.dirname(file_name) or '.'
