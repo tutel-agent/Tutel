@@ -127,12 +127,12 @@ def marlin_pack(w_unpacked):
     def unpack_weight_4d(packed_weight):
         # only for 4-bit weight packed in 8-bit (such as 2 fp4 in one uint8)
         device = packed_weight.device
-        # shape: [total_num_experts, out_feature, in_feature // groupsize, groupsize // 2]
-        E, N, G, half_groupsize = packed_weight.shape
-        w_bytes = packed_weight.view(E, N, G * half_groupsize)
+        # shape: [total_num_experts, out_feature, in_feature // group_size, group_size // 2]
+        E, N, G, half_group_size = packed_weight.shape
+        w_bytes = packed_weight.view(E, N, G * half_group_size)
         low = w_bytes & 0x0F
         high = (w_bytes >> 4) & 0x0F
-        # stack(..., dim=-1) -> [E, N, G*groupsize//2, 2] -> view -> [E, N, K]
+        # stack(..., dim=-1) -> [E, N, G*group_size//2, 2] -> view -> [E, N, K]
         w_unpacked = torch.stack([low, high], dim=-1).view(E, N, -1)
         # Marlin [In, Out]，GPTOSS [Out, In]
         return w_unpacked.transpose(1, 2).contiguous()
@@ -245,6 +245,78 @@ def marlin_nvfp4_process_global_scale(global_scale):
     exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp4_exponent - 1)
     return global_scale * (2.0 ** (exponent_bias - 7))
 
+def marlin_unpack(marlin_weight, group_size):
+    # reverse process of `marlin_pack()`
+    # group_size 32/16 for mxfp4/nvfp4
+
+    def _get_marlin_perms(device):
+        perm = []
+        for i in range(32):
+            perm1 = []
+            col = i // 4
+            for block in [0, 1]:
+                for row in [
+                    2 * (i % 4),
+                    2 * (i % 4) + 1,
+                    2 * (i % 4 + 4),
+                    2 * (i % 4 + 4) + 1
+                ]:
+                    perm1.append(16 * row + col + 8 * block)
+            for j in range(4):
+                perm.extend([p + 256 * j for p in perm1])
+        perm = np.array(perm)
+        interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
+        perm = perm.reshape((-1, 8))[:, interleave].ravel()
+        return torch.from_numpy(perm).long().to(device)
+    
+    def pack_weight_4d(w_unpacked):
+        # reverse process of `unpack_weight_4d()``
+        w = w_unpacked.transpose(1, 2).contiguous()
+        E, N, K = w.shape
+        if K % group_size != 0:
+            raise ValueError(f"In_features ({K}) should be able to be divided by group_size ({group_size})")
+        
+        # 2. Pack 4-bit into 8-bit
+        # [E, N, K] -> [E, N, K//2, 2]
+        w_pairs = w.view(E, N, K // 2, 2)
+        low = w_pairs[..., 0].to(torch.uint8)
+        high = w_pairs[..., 1].to(torch.uint8)
+        # uint8: low | (high << 4)
+        packed_val = low | (high << 4)
+        # shape: [E, N, K//2] -> [E, N, G, half_group_size]
+        # where G = K // group_size, half_group_size = group_size // 2
+        packed_weight = packed_val.view(E, N, K // group_size, group_size // 2)
+        return packed_weight
+
+    device = marlin_weight.device
+    E, K_div_16, out_cols = marlin_weight.shape
+    
+    # pack_marlin : out_cols = N * 16 // 8 = N * 2
+    N = out_cols // 2
+    K = K_div_16 * 16
+    tile = 16
+    
+    # shape: [E, K//16, N*2] -> [E, K//16, N*2, 8]
+    unpacked_bits = torch.zeros((E, K_div_16, out_cols, 8), dtype=torch.int32, device=device)
+    
+    for i in range(8):
+        # marlin_weight: [E, K//16, out_cols]
+        # unpacked_bits[..., i]: [E, K//16, out_cols]
+        unpacked_bits[..., i] = (marlin_weight >> (4 * i)) & 0xF
+        
+    w = unpacked_bits.view(E, K_div_16, -1)
+    
+    perm = _get_marlin_perms(device)
+    inv_perm = torch.argsort(perm)
+    w_flat = w.reshape(-1, perm.numel())
+    w_unpermuted = w_flat[:, inv_perm]
+    w = w_unpermuted.reshape(E, K_div_16, N * tile)
+    w = w.reshape(E, K // tile, N // tile, tile, tile)
+    w = w.permute(0, 1, 3, 2, 4)
+    
+    w_unpacked = pack_weight_4d(w.reshape(E, K, N))
+    
+    return w_unpacked
 
 def __getattr__(name):
   fn = getattr(torch.ops.tutel_ops, name)
