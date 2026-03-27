@@ -958,7 +958,8 @@ static at::Tensor all_gather_native(const at::Tensor &input) {
 }
 
 static std::tuple<torch::Tensor, torch::Tensor> uncached_empty_ex(torch::IntArrayRef shape, at::ScalarType dtype) {
-  int64_t size = std::accumulate(shape.begin(), shape.end(), 1LL, std::multiplies<int64_t>()) * torch::elementSize(dtype);
+  int64_t buffer_size = 64 * 1024;
+  int64_t size = std::accumulate(shape.begin(), shape.end(), 1LL, std::multiplies<int64_t>()) * torch::elementSize(dtype) + buffer_size;
 
   auto device_index = c10::cuda::current_device();
   at::DeviceGuard device_guard(at::Device(at::DeviceType::CUDA, device_index));
@@ -1289,16 +1290,12 @@ std::tuple<torch::Tensor, torch::Tensor> warp_multi_head_latent_rope_bf16_v5(
   const torch::Tensor &qr,
   const torch::Tensor &q_b_proj,
   const torch::Tensor &k_b_proj,
-  const torch::Tensor &kv_ranges,
-  const torch::Tensor &kv_indices,
-  const torch::Tensor &kv_cache,
   int64_t n_local_heads
 ) {
   auto x = qr;
   CHECK_CUDA(x);
   CHECK_EQ(x.dtype(), torch::kBFloat16);
   CHECK_EQ(x.dim(), 3);
-  CHECK_EQ(kv_ranges.dtype(), torch::kInt32);
   CHECK_EQ(q_b_proj.dtype(), torch::kBFloat16);
 
   int batch = x.size(0), seqlen = x.size(1);
@@ -1706,7 +1703,6 @@ TORCH_LIBRARY(tutel_ops, m) {
   m.def("kimi_moe_sigmoid_scaled_topk", warp_kimi_sigmoid_top_8_static_v2);
   m.def("deepseek_moe_sigmoid_scaled_topk", warp_deepseek_sigmoid_top_8_static_v2);
   m.def("rmsnorm_bf16", warp_rmsnorm_bf16);
-  m.def("to_bfloat16", warp_to_bfloat16);
   m.def("to_float8_block", warp_to_float8_block);
   m.def("to_float8_per_token", warp_to_float8_per_token);
   m.def("scaled_mask_inv", warp_scaled_mask_inv);
