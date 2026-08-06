@@ -1,18 +1,15 @@
 # Tutel
 
-Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parallel solution proposing ["No-penalty Parallism/Sparsity/Capacity/.. Switching"](https://mlsys.org/media/mlsys-2023/Slides/2477.pdf) for modern training and inference that have dynamic behaviors.
-
-- Supported Framework: Pytorch (recommend: >= 2.0)
-- Supported GPUs: CUDA(fp64/fp32/fp16/bf16), ROCm(fp64/fp32/fp16/bf16)
-- Supported CPU: fp64/fp32
-- Support direct NVFP4/MXFP4/BlockwiseFP8 Inference for MoE-based GLM-5.x / DeepSeek-3.x / Kimi-2.x / Qwen3 / GptOSS using A100/A800/H100/MI300/..
+Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parallel solution proposing ["No-penalty Parallism/Sparsity/Capacity/.. Switching"](https://mlsys.org/media/mlsys-2023/Slides/2477.pdf) for modern training and inference that have dynamic behaviors. Support direct NVFP4/MXFP4/BlockwiseFP8 Inference for MoE-based GLM-5.x / DeepSeek-3.x / Kimi-2.x / Kimi-3.x / Qwen3 / Gpt-OSS using A100/A800/H100/MI300/..
 
 > [!TIP]
-> #### Steps for GLM-5/5.1/5.2 (Claude-Code Mode):
+> #### Steps for Kimi-K3/GLM-5.x (Claude-Code Mode):
 >
-> ☑ A100x8/H100x8 (80G SXM): max-context-size = 1M
+> ☑ A100x8/H100x8 (80G SXM) for GLM-5.x: max-context-size = 1M
 >
-> ☑ MI300x8 (192GB PCIe5): max-context-size = 1M × N
+> ☑ MI300x8 (192GB PCIe5) for GLM-5.x / Kimi K3: max-context-size = 1M +
+> 
+> ***Known Issues***: *(1) Kimi K3 only support MI300x8 instead of A100x8; (2) Limited by Memory, Kimi K3 only enables bsz=1 for MI300x8;*
 > 
 > ```sh
 > +---------------+--------------------+--------------------+
@@ -30,25 +27,25 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >   hf download --local-dir nvidia/GLM-5.2-NVFP4 nvidia/GLM-5.2-NVFP4
 >   hf download --local-dir nvidia/GLM-5.1-NVFP4 nvidia/GLM-5.1-NVFP4
 >   hf download --local-dir nvidia/GLM-5-NVFP4 nvidia/GLM-5-NVFP4
+>   hf download --local-dir moonshotai/Kimi-K3 moonshotai/Kimi-K3
 >
-> [ND_A100_80G_v4: Server GLM-5/5.1/5.2 (for Azure A100x8/H100x8/B200x8 SXM)]
+> [ND_MI300_192G_v5: Serve Kimi-K3/GLM-5/5.1/5.2 (for Azure MI300x8 PCIe)]
 >   docker run -e WORKER=1 -e LOCAL_SIZE=8 -p 8000:8000 -it --rm --ipc=host --shm-size=8g \
 >       --ulimit memlock=-1 --ulimit stack=67108864 -v /:/host -w /host$(pwd) \
->       -v /usr/lib/x86_64-linux-gnu/libcuda.so.1:/usr/lib/x86_64-linux-gnu/libcuda.so.1 --privileged \
->       tutelgroup/deepseek-671b:a100x8-chat-20260707 --serve=core \
+>       --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --device=/dev/kfd --device=/dev/dri --group-add=video \
+>       tutelgroup/deepseek-671b:mi300x8-chat-20260808 --serve=core \
+>         --try_path moonshotai/Kimi-K3 \
 >         --try_path nvidia/GLM-5.2-NVFP4 \
 >         --try_path nvidia/GLM-5.1-NVFP4 \
 >         --try_path nvidia/GLM-5-NVFP4 \
 >         --max_seq_len 1000000
 >
-> [ND_MI300_192G_v5: Server GLM-5/5.1/5.2 (for Azure MI300x8 PCIe)]
+> [ND_A100_80G_v4: Serve GLM-5/5.1/5.2 (for Azure A100x8/H100x8/B200x8 SXM)]
 >   docker run -e WORKER=1 -e LOCAL_SIZE=8 -p 8000:8000 -it --rm --ipc=host --shm-size=8g \
 >       --ulimit memlock=-1 --ulimit stack=67108864 -v /:/host -w /host$(pwd) \
->       --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --device=/dev/kfd --device=/dev/dri --group-add=video \
->       tutelgroup/deepseek-671b:mi300x8-chat-20260721 --serve=core \
+>       -v /usr/lib/x86_64-linux-gnu/libcuda.so.1:/usr/lib/x86_64-linux-gnu/libcuda.so.1 --privileged \
+>       tutelgroup/deepseek-671b:a100x8-chat-20260707 --serve=core \
 >         --try_path nvidia/GLM-5.2-NVFP4 \
->         --try_path nvidia/GLM-5.1-NVFP4 \
->         --try_path nvidia/GLM-5-NVFP4 \
 >         --max_seq_len 1000000
 > ```
 > 
@@ -188,6 +185,8 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 
 ## What's New:
 
+> Image-*20260808*: Support 1M context for Kimi K3 on MI300 192GB PCIe-5.
+>
 > Image-*20260707*: Memory fixes for 1M context on A100 80GB SXM.
 >
 > Image-*20260618*: Fit GLM-5.2 1M context into A100 80GB x 8 SXM.
