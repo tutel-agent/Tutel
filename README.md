@@ -9,25 +9,30 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >
 > ☑ MI300x8 (192GB PCIe5) for GLM-5.x / Kimi K3: max-context-size = 1M +
 > 
-> ***Known Issues***: *(1) Kimi K3 only support MI300x8 instead of A100x8; (2) Limited by Memory, Kimi K3 only enables bsz=1 for MI300x8;*
+> | Azure GPU Type (x8) | ***vLLM/SGL Kimi K3*** (no-MTP) | ***Tutel Kimi K3*** (no-MTP) |
+> |  ----  | ----  | ----  |
+> | AMD MI300X 2023 (750W) | OoM  | 73 |
+> | AMD MI325X 2024 (1000W) | 3.1  | 81 |
+> | AMD MI355X 2025 (1400W) | 43.5 | (no-dev-env, estimated >100) |
+> | NVIDIA B200 2024 (1000W) | OoM  | (no-dev-env) |
+> 
+> |  | FP4 + No Tools | FP4 + Tool Use |
+> |  ----  | ----  | ----  |
+> | Kimi-K3 @ GSM8K |   |  |
+> | GLM-5.2 @ GSM8K | 97.1%  | 97.8% |
+> | GLM-5.2 @ AIME25 | 96.1%  | 99.7% |
+> | GLM-5.2 @ AIME26 | 93.5%  | 99.6% |
+>
+> ***K3 Known Issues***: *(1) Kimi K3 support for MI300x/MI325x instead of A100x8 (GLM-5 only); (2) Limited by device memory, Kimi K3 only enables bsz=1 for MI300x8 (to be fixed soon);*
 > 
 > ```sh
-> +---------------+--------------------+--------------------+
-> |   [GLM-5.2]   | (NVFP4 + No Tools) | (NVFP4 + Tool Use) |
-> +---------------+--------------------+--------------------+
-> |   OAI/GSM8K   |      97.1%         |       97.8%        |
-> +---------------+--------------------+--------------------+
-> |   AIME-2025   |      96.1%         |       99.7%        |
-> +---------------+--------------------+--------------------+
-> |   AIME-2026   |      93.5%         |       99.6%        |
-> +---------------+--------------------+--------------------+
 > 
 > [Model Downloads]
 >   pip3 install -U "huggingface_hub[cli]" --upgrade
+>   hf download --local-dir moonshotai/Kimi-K3 moonshotai/Kimi-K3
 >   hf download --local-dir nvidia/GLM-5.2-NVFP4 nvidia/GLM-5.2-NVFP4
 >   hf download --local-dir nvidia/GLM-5.1-NVFP4 nvidia/GLM-5.1-NVFP4
 >   hf download --local-dir nvidia/GLM-5-NVFP4 nvidia/GLM-5-NVFP4
->   hf download --local-dir moonshotai/Kimi-K3 moonshotai/Kimi-K3
 >
 > [ND_MI300_192G_v5: Serve Kimi-K3/GLM-5/5.1/5.2 (for Azure MI300x8 PCIe)]
 >   docker run -e WORKER=1 -e LOCAL_SIZE=8 -p 8000:8000 -it --rm --ipc=host --shm-size=8g \
