@@ -11,14 +11,14 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 > 
 > | Azure GPU Type (x8) | ***vLLM/SGL Kimi K3*** (no-MTP) | ***Tutel Kimi K3*** (no-MTP) |
 > |  ----  | ----  | ----  |
-> | AMD MI300X 2023 (750W) | OoM  | 73 |
-> | AMD MI325X 2024 (1000W) | 3.1  | 81 |
-> | AMD MI355X 2025 (1400W) | 43.5 | (no-dev-env, estimated >100) |
-> | NVIDIA B200 2024 (1000W) | OoM  | (no-dev-env) |
+> | AMD MI300X 2023 (750W x8) | 0 t/s (OoM) | 73.4 t/s |
+> | AMD MI325X 2024 (1000W x8) | 3.1 t/s  | 81.0 t/s |
+> | AMD MI355X 2025 (1400W x8) | 43.5 t/s | (no-devenv) |
+> | NVIDIA B200 2024 (1000W x8) | 0 t/s (OoM)  | (no-devenv) |
 > 
 > |  | FP4 + No Tools | FP4 + Tool Use |
 > |  ----  | ----  | ----  |
-> | Kimi-K3 @ GSM8K |   |  |
+> | Kimi-K3 @ GSM8K | 96.9%  | 96.9% |
 > | GLM-5.2 @ GSM8K | 97.1%  | 97.8% |
 > | GLM-5.2 @ AIME25 | 96.1%  | 99.7% |
 > | GLM-5.2 @ AIME26 | 93.5%  | 99.6% |
