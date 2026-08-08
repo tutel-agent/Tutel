@@ -5,16 +5,18 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 > [!TIP]
 > #### Steps for Kimi-K3/GLM-5.x (Claude-Code Mode):
 >
-> ☑ A100x8/H100x8 (80G SXM) for GLM-5.x: max-context-size = 1M
->
-> ☑ MI300x8 (192GB PCIe5) for GLM-5.x / Kimi K3: max-context-size = 1M +
+> ☑ A100x8/H100x8 (80G SXM) for GLM-5.x (0.8T): max-context-size = 1M
+> 
+> ☑ MI300x8 (192GB PCIe5) for GLM-5.x (0.8T): max-context-size = 1M
+> 
+> ☑ MI300x8 (192GB PCIe5) for Kimi K3 (2.8T): max-context-size = 1M
 > 
 > | Azure GPU Type (x8) | ***vLLM/SGL Kimi K3*** (no-MTP) | ***Tutel Kimi K3*** (no-MTP) |
 > |  ----  | ----  | ----  |
-> | AMD MI300X 2023 (750W x8) | 0 t/s (OoM) | 73.4 t/s |
+> | AMD MI300X 2023 (750W x8) | 0 t/s (OoM) | 73.4 - 76.5 t/s |
 > | AMD MI325X 2024 (1000W x8) | 3.1 t/s  | 81.0 t/s |
-> | AMD MI355X 2025 (1400W x8) | 43.5 t/s | (no-devenv) |
-> | NVIDIA B200 2024 (1000W x8) | 0 t/s (OoM)  | (no-devenv) |
+> | AMD MI355X 2025 (1400W x8) | 43.5 t/s | (TBD, no environment available) |
+> | NVIDIA B200 2024 (1000W x8) | 0 t/s (OoM)  | (TBD, no environment available) |
 > 
 > |  | FP4 + No Tools | FP4 + Tool Use |
 > |  ----  | ----  | ----  |
@@ -43,7 +45,7 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >         --try_path nvidia/GLM-5.2-NVFP4 \
 >         --try_path nvidia/GLM-5.1-NVFP4 \
 >         --try_path nvidia/GLM-5-NVFP4 \
->         --max_seq_len 1000000
+>         --max_seq_len 120000
 >
 > [ND_A100_80G_v4: Serve GLM-5/5.1/5.2 (for Azure A100x8/H100x8/B200x8 SXM)]
 >   docker run -e WORKER=1 -e LOCAL_SIZE=8 -p 8000:8000 -it --rm --ipc=host --shm-size=8g \
