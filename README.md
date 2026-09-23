@@ -37,7 +37,7 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >   hf download --local-dir modal-labs/Kimi-K3-DFlash modal-labs/Kimi-K3-DFlash
 >
 >   # GLM-5.3 Model:
->   hf download --local-dir Inferact/GLM-5.3-NVFP4 Inferact/GLM-5.3-NVFP4
+>   hf download --local-dir nvidia/GLM-5.3-NVFP4 nvidia/GLM-5.3-NVFP4
 >
 >   # GLM-5.3-Flash Model:
 >   hf download --local-dir nvidia/GLM-5.3-Flash-NVFP4 nvidia/GLM-5.3-Flash-NVFP4
@@ -46,9 +46,9 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >   docker run -e WORKER=1 -e LOCAL_SIZE=8 -p 8000:8000 -it --rm --ipc=host --shm-size=8g \
 >       --ulimit memlock=-1 --ulimit stack=67108864 -v /:/host -w /host$(pwd) \
 >       --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --device=/dev/kfd --device=/dev/dri --group-add=video \
->       tutelgroup/deepseek-671b:mi300x8-chat-20260902 --serve=core \
+>       tutelgroup/deepseek-671b:mi300x8-chat-20260929 --serve=core \
 >         --try_path nvidia/GLM-5.3-Flash-NVFP4 \
->         --try_path Inferact/GLM-5.3-NVFP4 \
+>         --try_path nvidia/GLM-5.3-NVFP4 \
 >         --try_path moonshotai/Kimi-K3 \
 >         --max_seq_len 200000 \
 >         --thinking_effort high
@@ -57,8 +57,9 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >   docker run -e WORKER=1 -e LOCAL_SIZE=8 -p 8000:8000 -it --rm --ipc=host --shm-size=8g \
 >       --ulimit memlock=-1 --ulimit stack=67108864 -v /:/host -w /host$(pwd) \
 >       -v /usr/lib/x86_64-linux-gnu/libcuda.so.1:/usr/lib/x86_64-linux-gnu/libcuda.so.1 --privileged \
->       tutelgroup/deepseek-671b:a100x8-chat-20260707 --serve=core \
->         --try_path Inferact/GLM-5.3-NVFP4 \
+>       tutelgroup/deepseek-671b:a100x8-chat-20260929 --serve=core \
+>         --try_path nvidia/GLM-5.3-Flash-NVFP4 \
+>         --try_path nvidia/GLM-5.3-NVFP4 \
 >         --max_seq_len 200000
 >
 > ```
@@ -66,33 +67,19 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 > #### Agent Examples:
 > ```sh
 > # Vision Example in the container (for GLM-5.3-Flash and Kimi-K3 only):
-> node-container:$ claude-unattended "What is this - https://i0.hdslb.com/bfs/archive/14c094d92aabe3f9a5c4356a66a122fc335239f2.jpg"
+> node-container:$ claude-unattended "What is shown in the picture at https://i0.hdslb.com/bfs/archive/14c094d92aabe3f9a5c4356a66a122fc335239f2.jpg"
 >
 > # Text Example in the container:
 > node-container:$ claude-unattended "What time is it in PST?"
 > ```
 > 
-> #### Agent Setup for Linux / WSL (Ubuntu >= 24.04):
+> #### Agent Setup for Linux and Windows Subsystem Linux (Ubuntu >= 24.04):
 > ```sh
 > sudo apt-get install -y npm
 > sudo npm install -g @anthropic-ai/claude-code@2.1.199
-> cat > run_claude.sh <<EOF && chmod a+x run_claude.sh
-> mkdir -p config/
-> export ANTHROPIC_BASE_URL="http://0.0.0.0:8000"
-> export ANTHROPIC_API_KEY="sk-ant-api00-local-mock-key"
-> export CLAUDE_CONFIG_DIR="config"
-> export DISABLE_AUTOUPDATER=1
-> export API_TIMEOUT_MS=2147483647
-> export API_FORCE_IDLE_TIMEOUT=0
-> export CLAUDE_ENABLE_STREAM_WATCHDOG=0
-> export CLAUDE_ENABLE_BYTE_WATCHDOG=0
-> export CLAUDE_ENABLE_BYTE_WATCHDOG_BEDROCK=0
-> export CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=0
-> echo '{"customApiKeyResponses": {"approved": ["api00-local-mock-key"]}}' > config/.claude.json
-> claude
-> EOF
+> curl -LO http://127.0.0.1:8000/claude.cmd
 >
-> ./run_claude.sh
+> ./claude.cmd
 > ```
 > 
 > #### Agent Setup for Windows (>= 10.0):
@@ -100,24 +87,9 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 > winget install OpenJS.NodeJS.LTS
 > winget install --id Git.Git -e --source winget
 > npm install -g @anthropic-ai/claude-code@2.1.199
->   (
->     echo(@echo off
->     echo(if not exist config mkdir config
->     echo(set ANTHROPIC_BASE_URL=http://0.0.0.0:8000
->     echo(set ANTHROPIC_API_KEY=sk-ant-api00-local-mock-key
->     echo(set CLAUDE_CONFIG_DIR=config
->     echo(set DISABLE_AUTOUPDATER=1
->     echo(set API_TIMEOUT_MS=2147483647
->     echo(set API_FORCE_IDLE_TIMEOUT=0
->     echo(set CLAUDE_ENABLE_STREAM_WATCHDOG=0
->     echo(set CLAUDE_ENABLE_BYTE_WATCHDOG=0
->     echo(set CLAUDE_ENABLE_BYTE_WATCHDOG_BEDROCK=0
->     echo(set CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=0
->     echo(echo({"customApiKeyResponses": {"approved": ["api00-local-mock-key"]}} ^> config\.claude.json
->     echo(claude
-> ) > run_claude.bat
+> curl -LO http://127.0.0.1:8000/claude.cmd
 >
-> .\run_claude.bat
+> .\claude.cmd
 > ```
 ------------------
 
@@ -132,12 +104,14 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >   hf download nvidia/Kimi-K2.5-NVFP4 --local-dir nvidia/Kimi-K2.5-NVFP4
 >   hf download nvidia/Kimi-K2-Thinking-NVFP4 --local-dir nvidia/Kimi-K2-Thinking-NVFP4
 >   hf download nvidia/DeepSeek-V3.2-NVFP4 --local-dir nvidia/DeepSeek-V3.2-NVFP4
+>   hf download Inferact/GLM-5.3-NVFP4 --local-dir Inferact/GLM-5.3-NVFP4
 > 
 > [DeepSeek V3.2 Long-Context (for Azure A100x8/H100x8/B200x8 SXM)]
 >   docker run -e LOCAL_SIZE=8 -e WORKER=1 -it --rm --ipc=host --net=host --shm-size=8g \
 >       --ulimit memlock=-1 --ulimit stack=67108864 -v /:/host -w /host$(pwd) -v /tmp:/tmp \
 >       -v /usr/lib/x86_64-linux-gnu/libcuda.so.1:/usr/lib/x86_64-linux-gnu/libcuda.so.1 --privileged \
 >       tutelgroup/deepseek-671b:a100x8-chat-20260707 --serve=webui --listen_port 8000 \
+>         --try_path Inferact/GLM-5.3-NVFP4 \
 >         --try_path nvidia/GLM-5.2-NVFP4 \
 >         --try_path nvidia/GLM-5.1-NVFP4 \
 >         --try_path nvidia/GLM-5-NVFP4 \
@@ -166,11 +140,11 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >         --max_seq_len 1000000
 > 
 > [OpenAI/Ollama/Direct Request]
->   curl -N -X POST http://0.0.0.0:8000/chat -d '{"text": "Write a Python code of the Quicksort algorithm."}'
->   python3 -m tutel.examples.oai_request_stream --url '0.0.0.0:8000' --prompt 'Write a Python code of the Quicksort algorithm.'
+>   curl -N -X POST http://127.0.0.1:8000/chat -d '{"text": "Write a Python code of the Quicksort algorithm."}'
+>   python3 -m tutel.examples.oai_request_stream --url '127.0.0.1:8000' --prompt 'Write a Python code of the Quicksort algorithm.'
 > 
 > [Open-WebUI URL for Web browsers]
->   xdg-open http://0.0.0.0:8000
+>   xdg-open http://127.0.0.1:8000
 > ```
 
 ------------------
@@ -205,7 +179,7 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >         --try_path ./microsoft/VibeVoice-Large
 > 
 > [Audio Generation Request]
->   curl -X POST http://0.0.0.0:8001/chat -d '{"text": "VibeVoice is a novel framework designed for generating expressive, long-form, multi-speaker conversational audio, such as podcasts, from text."}' > sound_output.mp3
+>   curl -X POST http://127.0.0.1:8001/chat -d '{"text": "VibeVoice is a novel framework designed for generating expressive, long-form, multi-speaker conversational audio, such as podcasts, from text."}' > sound_output.mp3
 > ```
 
 
@@ -226,7 +200,9 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 
 ## What's New:
 
-> Image-*20260902*: Add Vision Support for Kimi-K3/GLM-5.3-Flash for MI300.
+> Image-*20260929*: Enable Multi-Concurrency for GLM-5.3-Flash; AMD HIP to 10.0.0.
+>
+> Image-*20260902*: Add Vision Support for Kimi-K3 and GLM-5.3-Flash for MI300.
 >
 > Image-*20260831*: Add GLM-5.3/GLM-5.3-Flash Support on MI300 192GB PCIe-5.
 >
@@ -296,7 +272,7 @@ print(topk_weights, topk_ids, topk_weights.sum(-1))
         --model_path ./deepseek-ai/DeepSeek-R1
 
     # Step-3: Issue a Prompt Request with curl
-    curl -X POST http://0.0.0.0:8000/chat -d '{"text": "Calculate the result of: 1 / (sqrt(5) - sqrt(3))"}'
+    curl -X POST http://127.0.0.1:8000/chat -d '{"text": "Calculate the result of: 1 / (sqrt(5) - sqrt(3))"}'
 ```
 
 > Tutel v0.3.3: Add all-to-all benchmark:
