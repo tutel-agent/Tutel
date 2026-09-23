@@ -53,13 +53,12 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >         --max_seq_len 200000 \
 >         --thinking_effort high
 >
-> [ND_A100_80G_v4: Serve GLM-5/5.1/5.2/5.3 (for Azure A100x8/H100x8/B200x8 SXM)]
->   docker run -e WORKER=1 -e LOCAL_SIZE=8 -p 8000:8000 -it --rm --ipc=host --shm-size=8g \
+> [ND_A100_80G_v4: Serve GLM-5/5.1/5.2/5.3 (for Azure A100x8/H100x8/B200x8/RTX-6000PRO SXM)]
+>   docker run -e WORKER=1 --runtime=runc -p 8000:8000 -it --rm --ipc=host --shm-size=8g \
 >       --ulimit memlock=-1 --ulimit stack=67108864 -v /:/host -w /host$(pwd) \
 >       -v /usr/lib/x86_64-linux-gnu/libcuda.so.1:/usr/lib/x86_64-linux-gnu/libcuda.so.1 --privileged \
 >       tutelgroup/deepseek-671b:a100x8-chat-20260929 --serve=core \
 >         --try_path nvidia/GLM-5.3-Flash-NVFP4 \
->         --try_path nvidia/GLM-5.3-NVFP4 \
 >         --max_seq_len 200000
 >
 > ```
