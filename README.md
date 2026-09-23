@@ -37,7 +37,7 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >   hf download --local-dir modal-labs/Kimi-K3-DFlash modal-labs/Kimi-K3-DFlash
 >
 >   # GLM-5.3 Model:
->   hf download --local-dir nvidia/GLM-5.3-NVFP4 nvidia/GLM-5.3-NVFP4
+>   hf download --local-dir Inferact/GLM-5.3-NVFP4 Inferact/GLM-5.3-NVFP4
 >
 >   # GLM-5.3-Flash Model:
 >   hf download --local-dir nvidia/GLM-5.3-Flash-NVFP4 nvidia/GLM-5.3-Flash-NVFP4
@@ -48,7 +48,7 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >       --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --device=/dev/kfd --device=/dev/dri --group-add=video \
 >       tutelgroup/deepseek-671b:mi300x8-chat-20260929 --serve=core \
 >         --try_path nvidia/GLM-5.3-Flash-NVFP4 \
->         --try_path nvidia/GLM-5.3-NVFP4 \
+>         --try_path Inferact/GLM-5.3-NVFP4 \
 >         --try_path moonshotai/Kimi-K3 \
 >         --max_seq_len 200000 \
 >         --thinking_effort high
