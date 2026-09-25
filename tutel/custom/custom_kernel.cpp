@@ -798,6 +798,11 @@ TORCH_LIBRARY(tutel_ops, m) {
       "Tensor w2, Tensor w2_scale, Tensor topk_ids, Tensor topk_weights, "
       "float w13_output_scale, float w2_output_scale) -> Tensor");
   m.def(
+      "fused_nvfp4_moe_swiglu_cpu_profile(Tensor x, Tensor w13, Tensor w13_scale, "
+      "Tensor w2, Tensor w2_scale, Tensor topk_ids, Tensor topk_weights, "
+      "float w13_output_scale, float w2_output_scale) "
+      "-> (Tensor, float[], str, str)");
+  m.def(
       "fused_mxfp4_moe_situ_cpu(Tensor x, Tensor w13, Tensor w13_scale, "
       "Tensor w2, Tensor w2_scale, Tensor topk_ids, Tensor topk_weights) "
       "-> Tensor");
@@ -817,6 +822,9 @@ TORCH_LIBRARY_IMPL(tutel_ops, CPU, m) {
   m.impl(
       "fused_nvfp4_moe_swiglu_cpu",
       TORCH_FN(tutel::fused_moe_nvfp4::fused_nvfp4_moe_swiglu_cpu));
+  m.impl(
+      "fused_nvfp4_moe_swiglu_cpu_profile",
+      TORCH_FN(tutel::fused_moe_nvfp4::fused_nvfp4_moe_swiglu_cpu_profile));
   m.impl(
       "fused_mxfp4_moe_situ_cpu",
       TORCH_FN(tutel::fused_moe_mxfp4::fused_mxfp4_moe_situ_cpu));

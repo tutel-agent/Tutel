@@ -19,6 +19,13 @@ This enables:
 Run `python example.py --end-to-end --small` or
 `python example.py --end-to-end-mxfp4 --small` after building.
 
+For NVFP4, add `--diagnose-internal` to `--end-to-end` to measure setup,
+W13+SwiGLU, hidden preparation, W2 setup, W2+reduction, and cleanup inside an
+instrumented native call. It also reports the kernels actually selected for
+W13 and W2. The ordinary benchmark has no timing instrumentation; the internal
+profile excludes dispatcher, result packaging, and Python overhead. Unlike
+`--diagnose-stages`, these are phases of the fused call, not standalone timings.
+
 > [!TIP]
 > #### Steps for Kimi-K3/GLM-5.x (Claude-Code Mode):
 >

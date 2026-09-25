@@ -9,10 +9,12 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string>
+#include <tuple>
 #include <vector>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -243,68 +245,38 @@ struct Nvfp4PreparedActivations {
   std::vector<float> even;
   std::vector<float> odd;
 
-  static float vector_activation_limit(int64_t activation_k) {
-    // Bound the absolute sum so vector lane grouping cannot overflow where
-    // scalar-order activation * (FP4 * E4M3FN) accumulation stays finite.
-    const double maximum_dot_term =
-        6.0 * 448.0 * static_cast<double>(activation_k);
-    return static_cast<float>(
-        static_cast<double>(std::numeric_limits<float>::max()) /
-        maximum_dot_term);
-  }
-
-  static bool vector_value_is_safe(
-      c10::BFloat16 activation, float safe_activation) {
-    const float value = static_cast<float>(activation);
-    return std::isfinite(value) && std::abs(value) <= safe_activation;
-  }
-
-  static bool vector_values_are_safe(
-      const c10::BFloat16* activation,
-      int64_t activation_rows,
-      int64_t activation_k) {
-    const float safe_activation = vector_activation_limit(activation_k);
-    for (int64_t index = 0; index < activation_rows * activation_k; ++index) {
-      if (!vector_value_is_safe(activation[index], safe_activation)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  Nvfp4PreparedActivations(
-      int64_t activation_rows,
-      int64_t activation_k,
-      bool vector_values_safe = true)
-      : rows(activation_rows), K(activation_k), packed_k(activation_k / 2)
-#if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
-      , use_avx512_bf16(
-          vector_values_safe && activation_k % 32 == 0 &&
-          nvfp4_cpu_supports_avx512_bf16())
-#endif
-#if TUTEL_NVFP4_AVX2_AVAILABLE
-      , use_avx2(vector_values_safe && nvfp4_cpu_supports_avx2_fma())
-#endif
-  {
-#if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
-    if (use_avx512_bf16) {
-      avx512_bf16.resize(rows * K);
-      return;
-    }
-#endif
-    even.resize(rows * packed_k);
-    odd.resize(rows * packed_k);
-  }
-
   Nvfp4PreparedActivations(
       const c10::BFloat16* activation,
       int64_t activation_rows,
       int64_t activation_k)
-      : Nvfp4PreparedActivations(
-          activation_rows, activation_k,
-          vector_values_are_safe(activation, activation_rows, activation_k)) {
+      : rows(activation_rows), K(activation_k), packed_k(activation_k / 2)
 #if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
+      , use_avx512_bf16(
+          activation_k % 32 == 0 && nvfp4_cpu_supports_avx512_bf16())
+#endif
+#if TUTEL_NVFP4_AVX2_AVAILABLE
+      , use_avx2(nvfp4_cpu_supports_avx2_fma())
+#endif
+  {
+    // Bound the absolute sum so vector lane grouping cannot overflow where
+    // scalar-order activation * (FP4 * E4M3FN) accumulation stays finite.
+    const double maximum_dot_term =
+        6.0 * 448.0 * static_cast<double>(K);
+    const float safe_activation = static_cast<float>(
+        static_cast<double>(std::numeric_limits<float>::max()) /
+        maximum_dot_term);
+    bool vector_values_safe = true;
+    for (int64_t index = 0; index < rows * K; ++index) {
+      const float value = static_cast<float>(activation[index]);
+      if (!std::isfinite(value) || std::abs(value) > safe_activation) {
+        vector_values_safe = false;
+        break;
+      }
+    }
+#if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
+    use_avx512_bf16 = use_avx512_bf16 && vector_values_safe;
     if (use_avx512_bf16) {
+      avx512_bf16.resize(rows * K);
       for (int64_t row = 0; row < rows; ++row) {
         const int64_t row_offset = row * K;
         for (int64_t k = 0; k < K; k += 32) {
@@ -319,6 +291,11 @@ struct Nvfp4PreparedActivations {
       return;
     }
 #endif
+#if TUTEL_NVFP4_AVX2_AVAILABLE
+    use_avx2 = use_avx2 && vector_values_safe;
+#endif
+    even.resize(rows * packed_k);
+    odd.resize(rows * packed_k);
     for (int64_t row = 0; row < rows; ++row) {
       const int64_t source_offset = row * K;
       const int64_t target_offset = row * packed_k;
@@ -331,39 +308,18 @@ struct Nvfp4PreparedActivations {
     }
   }
 
-  inline void store(int64_t row, int64_t k, c10::BFloat16 value) {
+  const char* backend_name() const {
 #if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
     if (use_avx512_bf16) {
-      const int64_t permuted_k = (k / 32) * 32 + (k % 32) / 2 + (k % 2) * 16;
-      avx512_bf16[row * K + permuted_k] = value;
-      return;
-    }
-#endif
-    (k % 2 == 0 ? even : odd)[row * packed_k + k / 2] =
-        static_cast<float>(value);
-  }
-
-  void disable_vector_paths() {
-#if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
-    if (use_avx512_bf16) {
-      even.resize(rows * packed_k);
-      odd.resize(rows * packed_k);
-      for (int64_t row = 0; row < rows; ++row) {
-        for (int64_t k = 0; k < K; k += 32) {
-          for (int64_t i = 0; i < 16; ++i) {
-            even[row * packed_k + k / 2 + i] =
-                static_cast<float>(avx512_bf16[row * K + k + i]);
-            odd[row * packed_k + k / 2 + i] =
-                static_cast<float>(avx512_bf16[row * K + k + 16 + i]);
-          }
-        }
-      }
-      use_avx512_bf16 = false;
+      return "AVX512-BF16";
     }
 #endif
 #if TUTEL_NVFP4_AVX2_AVAILABLE
-    use_avx2 = false;
+    if (use_avx2) {
+      return "AVX2";
+    }
 #endif
+    return "scalar";
   }
 
   inline float dot(
@@ -613,7 +569,22 @@ inline torch::Tensor nvfp4_batched_gemv_w2_reduce_cpu(
       "tutel_ops::nvfp4_batched_gemv_w2_reduce");
 }
 
-inline torch::Tensor fused_nvfp4_moe_swiglu_cpu(
+struct Nvfp4MoeProfile {
+  using Clock = std::chrono::steady_clock;
+  Clock::time_point last;
+  std::array<double, 6> seconds{};
+  const char* w13_backend = "";
+  const char* w2_backend = "";
+
+  void record(size_t phase) {
+    const auto now = Clock::now();
+    seconds[phase] = std::chrono::duration<double>(now - last).count();
+    last = now;
+  }
+};
+
+template <bool kProfile>
+inline torch::Tensor fused_nvfp4_moe_swiglu_cpu_impl(
     const torch::Tensor& x,
     const torch::Tensor& w13,
     const torch::Tensor& w13_scale,
@@ -622,7 +593,11 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu(
     const torch::Tensor& topk_ids,
     const torch::Tensor& topk_weights,
     double w13_output_scale,
-    double w2_output_scale) {
+    double w2_output_scale,
+    Nvfp4MoeProfile* profile) {
+  if constexpr (kProfile) {
+    profile->last = Nvfp4MoeProfile::Clock::now();
+  }
   TORCH_CHECK(x.device().is_cpu(), "x must be a CPU tensor");
   TORCH_CHECK(w13.device().is_cpu(), "w13 must be a CPU tensor");
   TORCH_CHECK(w13_scale.device().is_cpu(), "w13_scale must be a CPU tensor");
@@ -783,10 +758,9 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu(
   const uint8_t* w13_scale_data = w13_scale.data_ptr<uint8_t>();
   const int64_t w13_packed_k = K / 2;
   const int64_t w13_scale_k = K / 16;
-  Nvfp4PreparedActivations prepared_hidden(routes, I);
-  const float hidden_activation_limit =
-      Nvfp4PreparedActivations::vector_activation_limit(I);
-  std::atomic<bool> hidden_values_safe{true};
+  auto hidden = torch::empty(
+      {routes, I}, x.options().dtype(torch::kBFloat16));
+  c10::BFloat16* hidden_data = hidden.data_ptr<c10::BFloat16>();
 
   // Keep gate and up reads contiguous within a block without adding a second
   // OpenMP region for a cache-resident elementwise SwiGLU pass.
@@ -795,9 +769,12 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu(
   const int64_t stage1_grain = std::max<int64_t>(
       1, stage1_work /
           std::max<int64_t>(1, static_cast<int64_t>(at::get_num_threads())));
+  if constexpr (kProfile) {
+    profile->w13_backend = prepared_x.backend_name();
+    profile->record(0);
+  }
   at::parallel_for(0, stage1_work, stage1_grain, [&](int64_t begin, int64_t end) {
     std::array<float, kW13RowBlock> gate_values;
-    bool local_hidden_values_safe = true;
     int64_t position = begin;
     while (position < end) {
       const int64_t route = position / I;
@@ -826,25 +803,22 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu(
               token,
               w13_data + row * w13_packed_k,
               w13_scale_data + row * w13_scale_k);
-          const c10::BFloat16 hidden_value(
+          hidden_data[route * I + i] = c10::BFloat16(
               nvfp4_silu(gate_values[i - block_begin]) * up);
-          prepared_hidden.store(route, i, hidden_value);
-          if (!Nvfp4PreparedActivations::vector_value_is_safe(
-                  hidden_value, hidden_activation_limit)) {
-            local_hidden_values_safe = false;
-          }
         }
       }
       position = segment_end;
     }
-    if (!local_hidden_values_safe) {
-      hidden_values_safe.store(false, std::memory_order_relaxed);
-    }
   });
+  if constexpr (kProfile) {
+    profile->record(1);
+  }
 
-  // W13 writes the W2 layout directly; only unsafe values need a conversion.
-  if (!hidden_values_safe.load(std::memory_order_relaxed)) {
-    prepared_hidden.disable_vector_paths();
+  // Returning from the W13 region is the only required stage barrier.
+  const Nvfp4PreparedActivations prepared_hidden(hidden_data, routes, I);
+  if constexpr (kProfile) {
+    profile->w2_backend = prepared_hidden.backend_name();
+    profile->record(2);
   }
   const uint8_t* w2_data = w2.data_ptr<uint8_t>();
   const uint8_t* w2_scale_data = w2_scale.data_ptr<uint8_t>();
@@ -859,6 +833,9 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu(
       1, stage2_work /
           std::max<int64_t>(1, static_cast<int64_t>(at::get_num_threads())));
   constexpr int64_t kW2OutputBlock = 256;
+  if constexpr (kProfile) {
+    profile->record(3);
+  }
   at::parallel_for(0, stage2_work, stage2_grain, [&](int64_t begin, int64_t end) {
     std::array<float, kW2OutputBlock> accumulator;
     int64_t position = begin;
@@ -899,7 +876,46 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu(
       position = segment_end;
     }
   });
+  if constexpr (kProfile) {
+    profile->record(4);
+  }
   return output;
+}
+
+inline torch::Tensor fused_nvfp4_moe_swiglu_cpu(
+    const torch::Tensor& x,
+    const torch::Tensor& w13,
+    const torch::Tensor& w13_scale,
+    const torch::Tensor& w2,
+    const torch::Tensor& w2_scale,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights,
+    double w13_output_scale,
+    double w2_output_scale) {
+  return fused_nvfp4_moe_swiglu_cpu_impl<false>(
+      x, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights,
+      w13_output_scale, w2_output_scale, nullptr);
+}
+
+inline std::tuple<torch::Tensor, std::vector<double>, std::string, std::string>
+fused_nvfp4_moe_swiglu_cpu_profile(
+    const torch::Tensor& x,
+    const torch::Tensor& w13,
+    const torch::Tensor& w13_scale,
+    const torch::Tensor& w2,
+    const torch::Tensor& w2_scale,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights,
+    double w13_output_scale,
+    double w2_output_scale) {
+  Nvfp4MoeProfile profile;
+  auto output = fused_nvfp4_moe_swiglu_cpu_impl<true>(
+      x, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights,
+      w13_output_scale, w2_output_scale, &profile);
+  profile.record(5);
+  return {
+      output, std::vector<double>(profile.seconds.begin(), profile.seconds.end()),
+      profile.w13_backend, profile.w2_backend};
 }
 
 } // namespace fused_moe_nvfp4

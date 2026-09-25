@@ -102,6 +102,11 @@ def parse_args():
         help="For M=1 end-to-end, time equivalent standalone W13 and W2 stages.",
     )
     parser.add_argument(
+        "--diagnose-internal",
+        action="store_true",
+        help="For --end-to-end, report actual fused CPU phase timings and selected kernels.",
+    )
+    parser.add_argument(
         "--small",
         action="store_true",
         help="Use mode-specific small dimensions for a quick correctness run.",
@@ -110,6 +115,8 @@ def parse_args():
 
 
 def validate_args(args):
+    if args.diagnose_internal and not args.end_to_end:
+        raise ValueError("--diagnose-internal requires --end-to-end")
     if args.experts is None:
         args.experts = 896 if args.end_to_end_mxfp4 else 256
     if args.topk is None:
@@ -739,8 +746,49 @@ def diagnose_end_to_end_stages(args, tensors, end_to_end_median):
     overhead = end_to_end_median - stage_sum
     overhead_percent = 100.0 * overhead / stage_sum
     print(
-        "E2E overhead vs stage sum: {:+.3f} us ({:+.2f}%)".format(
+        "E2E difference vs standalone sum (not internal overhead): "
+        "{:+.3f} us ({:+.2f}%)".format(
             overhead * 1e6, overhead_percent
+        )
+    )
+
+
+def diagnose_nvfp4_internal(args, tensors):
+    op = torch.ops.tutel_ops.fused_nvfp4_moe_swiglu_cpu_profile
+    scalar_args = (args.w13_output_scale, args.w2_output_scale)
+    for _ in range(args.warmup):
+        op(*tensors, *scalar_args)
+    samples = []
+    backends = set()
+    for _ in range(args.iterations):
+        _, phase_seconds, w13_backend, w2_backend = op(*tensors, *scalar_args)
+        samples.append(phase_seconds)
+        backends.add((w13_backend, w2_backend))
+
+    print("Actual kernel dispatch: {}".format(
+        "; ".join(
+            "W13={}, W2={}".format(w13, w2) for w13, w2 in sorted(backends)
+        )
+    ))
+    phase_names = (
+        "setup", "W13+SwiGLU", "hidden_prepare",
+        "W2_setup", "W2+reduction", "cleanup",
+    )
+    medians = [
+        statistics.median(sample[index] for sample in samples)
+        for index in range(len(phase_names))
+    ]
+    print("Internal fused profile (median us; instrumented): {}".format(
+        ", ".join(
+            "{}={:.3f}".format(name, value * 1e6)
+            for name, value in zip(phase_names, medians)
+        )
+    ))
+    totals = [sum(sample) for sample in samples]
+    print(
+        "Internal native total: median={:.3f} us, mean={:.3f} us "
+        "(excludes dispatcher, result packaging and Python)".format(
+            statistics.median(totals) * 1e6, statistics.mean(totals) * 1e6
         )
     )
 
@@ -996,6 +1044,8 @@ def run_end_to_end(args):
     )
     if args.diagnose_stages:
         diagnose_end_to_end_stages(args, tensors, median)
+    if args.diagnose_internal:
+        diagnose_nvfp4_internal(args, tensors)
     print("Checksum: {:.9g}".format(output.float().sum().item()))
     return 0
 
@@ -1005,6 +1055,14 @@ def main():
     try:
         validate_args(args)
         load_extension()
+        if args.diagnose_internal and not hasattr(
+            torch.ops.tutel_ops, "fused_nvfp4_moe_swiglu_cpu_profile"
+        ):
+            raise RuntimeError(
+                "NVFP4 internal profiling is unavailable. Rebuild with "
+                "`NO_CUDA=1 python setup.py build_ext --inplace --force "
+                "--enable_cpu_moe`."
+            )
         if args.end_to_end_mxfp4 and not hasattr(
             torch.ops.tutel_ops, "fused_mxfp4_moe_situ_cpu"
         ):
