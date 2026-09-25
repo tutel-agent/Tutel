@@ -1,2 +1,4 @@
 include tutel/ops/cuda/*
 include tutel/ops/rocm/*
+include tutel/custom/fused_moe_nvfp4.h
+include tutel/custom/fused_moe_mxfp4.h

@@ -2,6 +2,113 @@
 
 Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parallel solution proposing ["No-penalty Parallism/Sparsity/Capacity/.. Switching"](https://mlsys.org/media/mlsys-2023/Slides/2477.pdf) for modern training and inference that have dynamic behaviors. Support direct NVFP4/MXFP4/BlockwiseFP8 Inference for MoE-based GLM-5.x / DeepSeek-3.x / Kimi-2.x / Kimi-3.x / Qwen3 / Gpt-OSS using A100/A800/H100/MI300/..
 
+## Optional CPU NVFP4/MXFP4 MoE operators
+
+The CPU MoE custom operators are disabled by default. Build them explicitly on
+Linux with:
+
+```sh
+NO_CUDA=1 python setup.py build_ext --inplace --force --enable_cpu_moe
+```
+
+This enables:
+
+- `tutel_ops::fused_nvfp4_moe_swiglu_cpu(x, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, w13_output_scale, w2_output_scale)`: packed E2M1 with raw group-16 E4M3FN scales.
+- `tutel_ops::fused_mxfp4_moe_situ_cpu(x, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights)`: Kimi K3 packed E2M1 with group-32 E8M0 scales (`2 ** (byte - 127)`) and SiTU-GLU.
+
+Run `python example.py --end-to-end --small` or
+`python example.py --end-to-end-mxfp4 --small` after building.
+
+For NVFP4, add `--diagnose-internal` to `--end-to-end` to measure setup,
+W13+SwiGLU, hidden preparation, W2 setup, W2+reduction, and cleanup inside an
+instrumented native call. It also reports the kernels actually selected for
+W13 and W2. The ordinary benchmark has no timing instrumentation; the internal
+profile excludes dispatcher, result packaging, and Python overhead. Unlike
+`--diagnose-stages`, these are phases of the fused call, not standalone timings.
+
+Set `TUTEL_NVFP4_ROW_TILE=4` to try the four-row AVX512-BF16 kernel in the fused
+NVFP4 operator. It shares activation loads across consecutive output rows while
+preserving each row's accumulation order and the routing reduction order.
+`TUTEL_NVFP4_ROW_TILE=1` (the default) retains the single-row loops for same-build
+A/B comparisons. The internal profile reports `AVX512-BF16/rows4` when this path
+is selected; short tails use single-row dots. AVX2, scalar, and unsafe-value
+fallbacks remain unchanged. Standalone stage operators remain single-row
+references. Rebuild the extension before using this option.
+
+Use `python example.py --end-to-end --compare-row-tiles` for a same-process
+A/B comparison. It reuses the tensors and thread configuration, alternates
+single-row/four-row call order, and reports uninstrumented latency, effective
+bandwidth, and paired speedup. Each mode receives `--warmup` warmups and
+`--iterations` timed calls. Mode detection and full-output comparisons are
+outside timing, and the original environment setting is restored afterward.
+No four-row comparison is reported when both stages use fallback kernels.
+`--diagnose-internal` still measures a separate instrumented batch; its medians
+must not be subtracted from these A/B latencies to infer dispatcher overhead.
+
+Set `TUTEL_NVFP4_W2_SCHEDULE=routes` to try W2 parallelism over route/output
+positions rather than output positions alone. It writes FP32 scaled projections,
+then reduces routes in the original order without intermediate BF16 rounding.
+ATen OpenMP builds reuse one team for projection and reduction, with a barrier
+between them; other backends use two ATen parallel regions. The extra scratch
+buffer is `M*T*N*4` bytes (144 KiB for `M=1, T=9, N=4096`). Its allocation is
+included in W2 setup, and both compute phases are included in W2+reduction.
+The profile appends `/routes` to the W2 backend, including fallback kernels.
+The default `output` schedule is unchanged; `routes` is experimental and may
+lose to the default because of the extra synchronization and scratch traffic.
+
+After rebuilding, run
+`TUTEL_NVFP4_ROW_TILE=1 python example.py --end-to-end --compare-w2-schedules`
+to compare `output`/`routes` in the same process with alternating call order.
+This uses the same timing, equality, and environment-restoration rules as the
+row-tile comparison. The other tuning setting stays fixed during each comparison;
+both flags can be used together. Effective bandwidth still counts logical
+weight+scale bytes, not scratch traffic or measured DRAM traffic.
+
+For target-side bottleneck evidence, run on Linux with a matching `perf` tool:
+
+```sh
+env TUTEL_NVFP4_ROW_TILE=1 TUTEL_NVFP4_W2_SCHEDULE=output \
+    OMP_NUM_THREADS=132 OMP_DYNAMIC=FALSE OMP_PLACES=cores OMP_PROC_BIND=spread \
+    python example.py --end-to-end --threads 132 --warmup 20 --iterations 10000 \
+    --diagnose-internal --profile-perf
+```
+
+`--profile-perf` attaches `perf stat` and `perf record` to the existing process,
+including its worker threads, in **separate** batches on the same tensors.
+Each batch has `--warmup` calls with events disabled, followed by `--iterations`
+ordinary operator calls between acknowledged enable/disable commands. Input
+allocation, correctness, native phase profiling, and report generation are
+outside the collection windows. Ordinary latency is measured before perf starts.
+Profiling includes Python dispatch, OpenMP spinning, and small control-boundary
+overhead; do not treat its batch durations as uninstrumented latency.
+
+A new `nvfp4-perf-*` directory contains `stat.txt` (counts/IPC), `hotspots.txt`
+(user-space cycle samples by shared library/symbol), `cpu-hotspots.txt`
+(samples broken down by CPU/task/symbol), `perf.data` (for further
+`perf report`/`perf annotate` analysis), and `metadata.json` (backend, baseline,
+commands, batch durations, thread affinity masks and CPU/NUMA topology).
+Use `--perf-output NEW_DIRECTORY` to choose its location; existing directories
+are not overwritten. Sampling is 99 Hz per active thread without call stacks.
+Keep the native extension binary associated with `perf.data` for symbol analysis.
+No native rebuild is needed when the existing internal profiler is available.
+
+Generic cache events do not measure DRAM bandwidth or remote-NUMA traffic, and
+low aggregate IPC alone does not identify a memory bottleneck. Affinity masks
+also include idle threads and are not proof of active core usage. `perf stat`'s
+wall-clock elapsed time may include disabled setup/warmup; the gated loop
+duration is recorded separately in metadata. Check unsupported/not-counted
+events, multiplexing percentages, and any lost-sample/throttling warnings before
+interpreting results. Such warnings mark the capture as partial in metadata.
+Hotspot percentages aggregate worker CPU cycles, not shares of end-to-end wall
+time; a high OpenMP spin fraction alone does not quantify barrier latency.
+
+Missing perf, insufficient PMU permissions, unsupported control options, and
+timeouts are reported explicitly; logs and incomplete metadata are retained.
+The script does not install perf, elevate privileges, alter
+`perf_event_paranoid`, change affinity, or fetch external debug symbols. Ask the
+machine administrator for appropriate profiling access if perf is denied.
+Use a fixed kernel mode: A/B comparison flags cannot be combined with this option.
+
 > [!TIP]
 > #### Steps for Kimi-K3/GLM-5.x (Claude-Code Mode):
 >
