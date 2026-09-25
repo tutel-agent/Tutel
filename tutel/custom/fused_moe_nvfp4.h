@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <tuple>
@@ -78,6 +79,13 @@ inline float nvfp4_dot_scalar(
   return sum;
 }
 
+inline uint16_t nvfp4_bf16_magnitude_limit(float safe_activation) {
+  uint32_t bits;
+  std::memcpy(&bits, &safe_activation, sizeof(bits));
+  // Truncate, not round: the largest allowed BF16 must not exceed the FP32 bound.
+  return static_cast<uint16_t>(bits >> 16);
+}
+
 #if (defined(__x86_64__) || defined(__i386__)) && \
     (defined(__GNUC__) || defined(__clang__)) && !defined(__CUDACC__)
 #define TUTEL_NVFP4_AVX2_AVAILABLE 1
@@ -105,7 +113,8 @@ inline float nvfp4_dot_scalar(
 #if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
 inline bool nvfp4_cpu_supports_avx512_bf16() {
   __builtin_cpu_init();
-  return __builtin_cpu_supports("avx512f") &&
+  return __builtin_cpu_supports("avx2") &&
+      __builtin_cpu_supports("avx512f") &&
       __builtin_cpu_supports("avx512bw") &&
       __builtin_cpu_supports("avx512vl") &&
       __builtin_cpu_supports("avx512dq") &&
@@ -154,6 +163,44 @@ inline bool nvfp4_cpu_supports_avx2_fma() {
 #else
   return true;
 #endif
+}
+
+TUTEL_NVFP4_AVX2_TARGET inline bool nvfp4_prepare_bf16_avx2(
+    const c10::BFloat16* activation,
+    c10::BFloat16* permuted,
+    int64_t count,
+    uint16_t magnitude_limit) {
+  const __m256i sign_mask = _mm256_set1_epi16(0x7fff);
+  const __m256i shuffle = _mm256_setr_epi8(
+      0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15,
+      0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15);
+  __m256i max_magnitude = _mm256_setzero_si256();
+  // K is a multiple of 32. Each block becomes the even/odd halves consumed
+  // by the AVX512 dot kernel; unsigned BF16 magnitudes also reject Inf/NaN.
+  for (int64_t index = 0; index < count; index += 32) {
+    const __m256i first = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(activation + index));
+    const __m256i second = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(activation + index + 16));
+    max_magnitude = _mm256_max_epu16(
+        max_magnitude,
+        _mm256_max_epu16(
+            _mm256_and_si256(first, sign_mask),
+            _mm256_and_si256(second, sign_mask)));
+    const __m256i first_halves = _mm256_permute4x64_epi64(
+        _mm256_shuffle_epi8(first, shuffle), _MM_SHUFFLE(3, 1, 2, 0));
+    const __m256i second_halves = _mm256_permute4x64_epi64(
+        _mm256_shuffle_epi8(second, shuffle), _MM_SHUFFLE(3, 1, 2, 0));
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(permuted + index),
+        _mm256_permute2x128_si256(first_halves, second_halves, 0x20));
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(permuted + index + 16),
+        _mm256_permute2x128_si256(first_halves, second_halves, 0x31));
+  }
+  const __m256i limit = _mm256_set1_epi16(static_cast<short>(magnitude_limit));
+  return _mm256_movemask_epi8(_mm256_cmpeq_epi16(
+      _mm256_max_epu16(max_magnitude, limit), limit)) == -1;
 }
 
 TUTEL_NVFP4_AVX2_TARGET inline float nvfp4_dot_avx2(
@@ -266,31 +313,27 @@ struct Nvfp4PreparedActivations {
         static_cast<double>(std::numeric_limits<float>::max()) /
         maximum_dot_term);
     bool vector_values_safe = true;
-    for (int64_t index = 0; index < rows * K; ++index) {
-      const float value = static_cast<float>(activation[index]);
-      if (!std::isfinite(value) || std::abs(value) > safe_activation) {
-        vector_values_safe = false;
-        break;
-      }
-    }
 #if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
-    use_avx512_bf16 = use_avx512_bf16 && vector_values_safe;
     if (use_avx512_bf16) {
       avx512_bf16.resize(rows * K);
-      for (int64_t row = 0; row < rows; ++row) {
-        const int64_t row_offset = row * K;
-        for (int64_t k = 0; k < K; k += 32) {
-          for (int64_t i = 0; i < 16; ++i) {
-            avx512_bf16[row_offset + k + i] =
-                activation[row_offset + k + 2 * i];
-            avx512_bf16[row_offset + k + 16 + i] =
-                activation[row_offset + k + 2 * i + 1];
-          }
+      vector_values_safe = nvfp4_prepare_bf16_avx2(
+          activation, avx512_bf16.data(), rows * K,
+          nvfp4_bf16_magnitude_limit(safe_activation));
+      if (vector_values_safe) {
+        return;
+      }
+      use_avx512_bf16 = false;
+    } else
+#endif
+    {
+      for (int64_t index = 0; index < rows * K; ++index) {
+        const float value = static_cast<float>(activation[index]);
+        if (!std::isfinite(value) || std::abs(value) > safe_activation) {
+          vector_values_safe = false;
+          break;
         }
       }
-      return;
     }
-#endif
 #if TUTEL_NVFP4_AVX2_AVAILABLE
     use_avx2 = use_avx2 && vector_values_safe;
 #endif
