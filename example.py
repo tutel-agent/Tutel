@@ -113,6 +113,11 @@ def parse_args():
         help="For --end-to-end, alternate row tiles 1/4 on the same tensors in one process.",
     )
     parser.add_argument(
+        "--compare-w2-schedules",
+        action="store_true",
+        help="For --end-to-end, alternate output/routes W2 scheduling on the same tensors.",
+    )
+    parser.add_argument(
         "--small",
         action="store_true",
         help="Use mode-specific small dimensions for a quick correctness run.",
@@ -125,6 +130,8 @@ def validate_args(args):
         raise ValueError("--diagnose-internal requires --end-to-end")
     if args.compare_row_tiles and not args.end_to_end:
         raise ValueError("--compare-row-tiles requires --end-to-end")
+    if args.compare_w2_schedules and not args.end_to_end:
+        raise ValueError("--compare-w2-schedules requires --end-to-end")
     if args.experts is None:
         args.experts = 896 if args.end_to_end_mxfp4 else 256
     if args.topk is None:
@@ -802,81 +809,103 @@ def diagnose_nvfp4_internal(args, tensors):
 
 
 def compare_nvfp4_row_tiles(args, tensors):
+    compare_nvfp4_modes(args, tensors, row_tiles=True)
+
+
+def compare_nvfp4_w2_schedules(args, tensors):
+    compare_nvfp4_modes(args, tensors, row_tiles=False)
+
+
+def compare_nvfp4_modes(args, tensors, *, row_tiles):
     op = torch.ops.tutel_ops.fused_nvfp4_moe_swiglu_cpu
     profile_op = torch.ops.tutel_ops.fused_nvfp4_moe_swiglu_cpu_profile
     scalar_args = (args.w13_output_scale, args.w2_output_scale)
-    env_name = "TUTEL_NVFP4_ROW_TILE"
-    original_tile = os.environ.get(env_name)
+    if row_tiles:
+        env_name, modes = "TUTEL_NVFP4_ROW_TILE", (1, 4)
+        title, mode_label, names = "Row-tile A/B", "tile", ("tile1", "tile4")
+    else:
+        env_name, modes = "TUTEL_NVFP4_W2_SCHEDULE", ("output", "routes")
+        title, mode_label, names = "W2-schedule A/B", "schedule", modes
+    original_mode = os.environ.get(env_name)
     outputs = {}
     backends = {}
-    latencies = {1: [], 4: []}
+    latencies = {mode: [] for mode in modes}
     try:
-        for tile in (1, 4):
-            os.environ[env_name] = str(tile)
+        for mode in modes:
+            os.environ[env_name] = str(mode)
             output, _, w13_backend, w2_backend = profile_op(*tensors, *scalar_args)
-            outputs[tile] = output
-            backends[tile] = (w13_backend, w2_backend)
-            if (
-                tile == 4 and "AVX512-BF16" in backends[tile]
-                or tile == 1 and "AVX512-BF16/rows4" in backends[tile]
-            ):
-                raise RuntimeError(
-                    "The extension did not honor TUTEL_NVFP4_ROW_TILE={}. "
-                    "Rebuild the CPU extension with --enable_cpu_moe.".format(tile)
+            outputs[mode] = output
+            backends[mode] = (w13_backend, w2_backend)
+            if row_tiles:
+                honored = all(
+                    ("rows4" in backend.split("/")) == (mode == 4)
+                    for backend in backends[mode]
+                    if backend.split("/")[0] == "AVX512-BF16"
                 )
-        if "AVX512-BF16/rows4" not in backends[4]:
+            else:
+                honored = ("routes" in w2_backend.split("/")) == (mode == "routes")
+            if not honored:
+                raise RuntimeError(
+                    "The extension did not honor {}={}. "
+                    "Rebuild the CPU extension with --enable_cpu_moe.".format(env_name, mode)
+                )
+        if row_tiles and not any(
+            "rows4" in backend.split("/") for backend in backends[4]
+        ):
             print(
                 "Row-tile A/B skipped: no four-row AVX512-BF16 path selected "
                 "(W13={}, W2={}).".format(*backends[4])
             )
             return
         torch.testing.assert_close(
-            outputs[4], outputs[1], rtol=0, atol=0, equal_nan=True
+            outputs[modes[1]], outputs[modes[0]], rtol=0, atol=0, equal_nan=True
         )
         for iteration in range(args.warmup):
-            for tile in ((1, 4) if iteration % 2 == 0 else (4, 1)):
-                os.environ[env_name] = str(tile)
+            for mode in (modes if iteration % 2 == 0 else modes[::-1]):
+                os.environ[env_name] = str(mode)
                 op(*tensors, *scalar_args)
         for iteration in range(args.iterations):
-            for tile in ((1, 4) if iteration % 2 == 0 else (4, 1)):
-                os.environ[env_name] = str(tile)
+            for mode in (modes if iteration % 2 == 0 else modes[::-1]):
+                os.environ[env_name] = str(mode)
                 start = time.perf_counter()
                 output = op(*tensors, *scalar_args)
                 elapsed = time.perf_counter() - start
-                latencies[tile].append(elapsed)
-                outputs[tile] = output
+                latencies[mode].append(elapsed)
+                outputs[mode] = output
         torch.testing.assert_close(
-            outputs[4], outputs[1], rtol=0, atol=0, equal_nan=True
+            outputs[modes[1]], outputs[modes[0]], rtol=0, atol=0, equal_nan=True
         )
     finally:
-        if original_tile is None:
+        if original_mode is None:
             os.environ.pop(env_name, None)
         else:
-            os.environ[env_name] = original_tile
+            os.environ[env_name] = original_mode
 
     bytes_read = tensors[5].numel() * sum(
         tensor.numel() * tensor.element_size() // tensor.size(0)
         for tensor in tensors[1:5]
     )
     print(
-        "Row-tile A/B: same process/tensors, alternating 1->4 / 4->1, "
-        "{} samples per mode, uninstrumented calls".format(args.iterations)
+        "{}: same process/tensors, alternating {}->{} / {}->{}, "
+        "{} samples per mode, uninstrumented calls".format(
+            title, *modes, *modes[::-1], args.iterations
+        )
     )
-    for tile in (1, 4):
-        median = statistics.median(latencies[tile])
+    for mode in modes:
+        median = statistics.median(latencies[mode])
         print(
-            "  tile={}: median={:.3f} us, mean={:.3f} us, "
+            "  {}={}: median={:.3f} us, mean={:.3f} us, "
             "effective Weight+scale={:.3f} GB/s; W13={}, W2={}".format(
-                tile, median * 1e6, statistics.mean(latencies[tile]) * 1e6,
-                bytes_read / median / 1e9, *backends[tile],
+                mode_label, mode, median * 1e6, statistics.mean(latencies[mode]) * 1e6,
+                bytes_read / median / 1e9, *backends[mode],
             )
         )
-    ratios = [one / four for one, four in zip(latencies[1], latencies[4])]
-    wins = sum(four < one for one, four in zip(latencies[1], latencies[4]))
+    ratios = [old / new for old, new in zip(latencies[modes[0]], latencies[modes[1]])]
+    wins = sum(new < old for old, new in zip(latencies[modes[0]], latencies[modes[1]]))
     print(
-        "  Paired median speedup (tile1/tile4)={:.3f}x; "
-        "tile4 faster in {}/{} pairs; outputs match.".format(
-            statistics.median(ratios), wins, args.iterations
+        "  Paired median speedup ({}/{})={:.3f}x; "
+        "{} faster in {}/{} pairs; outputs match.".format(
+            *names, statistics.median(ratios), names[1], wins, args.iterations
         )
     )
 
@@ -1136,6 +1165,8 @@ def run_end_to_end(args):
         diagnose_nvfp4_internal(args, tensors)
     if args.compare_row_tiles:
         compare_nvfp4_row_tiles(args, tensors)
+    if args.compare_w2_schedules:
+        compare_nvfp4_w2_schedules(args, tensors)
     print("Checksum: {:.9g}".format(output.float().sum().item()))
     return 0
 
@@ -1145,7 +1176,9 @@ def main():
     try:
         validate_args(args)
         load_extension()
-        if (args.diagnose_internal or args.compare_row_tiles) and not hasattr(
+        if (
+            args.diagnose_internal or args.compare_row_tiles or args.compare_w2_schedules
+        ) and not hasattr(
             torch.ops.tutel_ops, "fused_nvfp4_moe_swiglu_cpu_profile"
         ):
             raise RuntimeError(

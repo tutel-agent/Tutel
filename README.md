@@ -45,6 +45,25 @@ No four-row comparison is reported when both stages use fallback kernels.
 `--diagnose-internal` still measures a separate instrumented batch; its medians
 must not be subtracted from these A/B latencies to infer dispatcher overhead.
 
+Set `TUTEL_NVFP4_W2_SCHEDULE=routes` to try W2 parallelism over route/output
+positions rather than output positions alone. It writes FP32 scaled projections,
+then reduces routes in the original order without intermediate BF16 rounding.
+ATen OpenMP builds reuse one team for projection and reduction, with a barrier
+between them; other backends use two ATen parallel regions. The extra scratch
+buffer is `M*T*N*4` bytes (144 KiB for `M=1, T=9, N=4096`). Its allocation is
+included in W2 setup, and both compute phases are included in W2+reduction.
+The profile appends `/routes` to the W2 backend, including fallback kernels.
+The default `output` schedule is unchanged; `routes` is experimental and may
+lose to the default because of the extra synchronization and scratch traffic.
+
+After rebuilding, run
+`TUTEL_NVFP4_ROW_TILE=1 python example.py --end-to-end --compare-w2-schedules`
+to compare `output`/`routes` in the same process with alternating call order.
+This uses the same timing, equality, and environment-restoration rules as the
+row-tile comparison. The other tuning setting stays fixed during each comparison;
+both flags can be used together. Effective bandwidth still counts logical
+weight+scale bytes, not scratch traffic or measured DRAM traffic.
+
 > [!TIP]
 > #### Steps for Kimi-K3/GLM-5.x (Claude-Code Mode):
 >

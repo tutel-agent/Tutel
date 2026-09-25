@@ -19,6 +19,10 @@
 #include <tuple>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
@@ -480,6 +484,93 @@ struct Nvfp4PreparedActivations {
   }
 };
 
+struct Nvfp4W2Routes {
+  static constexpr int64_t kOutputBlock = 256;
+  const Nvfp4PreparedActivations& activation;
+  const uint8_t* weight;
+  const uint8_t* scale;
+  const int64_t* route_ids;
+  const float* route_weights;
+  int64_t T;
+  int64_t N;
+  float output_scale;
+  float* projections;
+  c10::BFloat16* output;
+
+  void project(int64_t begin, int64_t end) const {
+    const int64_t packed_k = activation.packed_k;
+    const int64_t scale_k = activation.K / 16;
+    int64_t position = begin;
+    while (position < end) {
+      const int64_t route = position / N;
+      const int64_t output_begin = position - route * N;
+      const int64_t segment_end = std::min<int64_t>(end, (route + 1) * N);
+      const int64_t count = segment_end - position;
+      const int64_t row = route_ids[route] * N + output_begin;
+      activation.dot_rows(
+          route, weight + row * packed_k, scale + row * scale_k,
+          count, projections + position);
+      for (int64_t n = position; n < segment_end; ++n) {
+        projections[n] = output_scale * projections[n];
+      }
+      position = segment_end;
+    }
+  }
+
+  void reduce(int64_t begin, int64_t end) const {
+    std::array<float, kOutputBlock> accumulator;
+    int64_t position = begin;
+    while (position < end) {
+      const int64_t token = position / N;
+      const int64_t output_begin = position - token * N;
+      const int64_t segment_end = std::min<int64_t>(end, (token + 1) * N);
+      const int64_t output_end = segment_end - token * N;
+      for (int64_t block_begin = output_begin;
+           block_begin < output_end; block_begin += kOutputBlock) {
+        const int64_t count =
+            std::min<int64_t>(kOutputBlock, output_end - block_begin);
+        std::fill(accumulator.begin(), accumulator.begin() + count, 0.0f);
+        // Keep FP32 projections and the original top-k accumulation order.
+        for (int64_t topk = 0; topk < T; ++topk) {
+          const int64_t route = token * T + topk;
+          const float routing_weight = route_weights[route];
+          const float* projected = projections + route * N + block_begin;
+          for (int64_t n = 0; n < count; ++n) {
+            accumulator[n] += routing_weight * projected[n];
+          }
+        }
+        for (int64_t n = 0; n < count; ++n) {
+          output[token * N + block_begin + n] = c10::BFloat16(accumulator[n]);
+        }
+      }
+      position = segment_end;
+    }
+  }
+
+#ifdef _OPENMP
+  static int64_t thread_begin(int64_t work, int64_t tid, int64_t threads) {
+    return tid * (work / threads) + std::min<int64_t>(tid, work % threads);
+  }
+
+  void run_openmp(
+      int64_t projection_work, int64_t output_work, bool parallel) const {
+    // Reuse one team for both phases; even empty ranges must reach the barrier.
+#pragma omp parallel if(parallel)
+    {
+      const int64_t tid = omp_get_thread_num();
+      const int64_t threads = omp_get_num_threads();
+      project(
+          thread_begin(projection_work, tid, threads),
+          thread_begin(projection_work, tid + 1, threads));
+#pragma omp barrier
+      reduce(
+          thread_begin(output_work, tid, threads),
+          thread_begin(output_work, tid + 1, threads));
+    }
+  }
+#endif
+};
+
 template <bool kSwiGLU, bool kSharedActivation, bool kReduce>
 inline torch::Tensor nvfp4_batched_gemv_impl(
     const torch::Tensor& A_cpu,
@@ -713,12 +804,24 @@ inline int64_t nvfp4_fused_row_tile() {
   return 4;
 }
 
+inline bool nvfp4_fused_w2_routes() {
+  const char* value = std::getenv("TUTEL_NVFP4_W2_SCHEDULE");
+  if (value == nullptr || std::strcmp(value, "output") == 0) {
+    return false;
+  }
+  TORCH_CHECK(
+      std::strcmp(value, "routes") == 0,
+      "TUTEL_NVFP4_W2_SCHEDULE must be output or routes, got '", value, "'");
+  return true;
+}
+
 struct Nvfp4MoeProfile {
   using Clock = std::chrono::steady_clock;
   Clock::time_point last;
   std::array<double, 6> seconds{};
   const char* w13_backend = "";
   const char* w2_backend = "";
+  bool w2_routes = false;
 
   void record(size_t phase) {
     const auto now = Clock::now();
@@ -743,6 +846,7 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu_impl(
     profile->last = Nvfp4MoeProfile::Clock::now();
   }
   const int64_t row_tile = nvfp4_fused_row_tile();
+  const bool w2_routes = nvfp4_fused_w2_routes();
   TORCH_CHECK(x.device().is_cpu(), "x must be a CPU tensor");
   TORCH_CHECK(w13.device().is_cpu(), "w13 must be a CPU tensor");
   TORCH_CHECK(w13_scale.device().is_cpu(), "w13_scale must be a CPU tensor");
@@ -867,6 +971,12 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu_impl(
   TORCH_CHECK(
       N <= std::numeric_limits<int64_t>::max() / M,
       "M*N is too large");
+  if (w2_routes) {
+    TORCH_CHECK(
+        N <= std::numeric_limits<int64_t>::max() /
+            static_cast<int64_t>(sizeof(float)) / routes,
+        "M*T*N float32 projection buffer is too large");
+  }
 
   std::vector<int64_t> route_ids(routes);
   if (topk_ids.scalar_type() == at::kInt) {
@@ -979,7 +1089,7 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu_impl(
     profile->record(1);
   }
 
-  // Returning from the W13 region is the only required stage barrier.
+  // Complete every hidden row before preparing activations for W2.
   const Nvfp4PreparedActivations prepared_hidden(hidden_data, routes, I, row_tile);
   if constexpr (kProfile) {
     profile->w2_backend = prepared_hidden.backend_name();
@@ -997,7 +1107,39 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu_impl(
   const int64_t stage2_grain = std::max<int64_t>(
       1, stage2_work /
           std::max<int64_t>(1, static_cast<int64_t>(at::get_num_threads())));
-  constexpr int64_t kW2OutputBlock = 256;
+  if (w2_routes) {
+    auto projections = torch::empty(
+        {routes, N}, x.options().dtype(torch::kFloat32));
+    const Nvfp4W2Routes work{
+        prepared_hidden, w2_data, w2_scale_data, route_ids.data(),
+        route_weights, T, N, w2_output_scale_f,
+        projections.data_ptr<float>(), output_data};
+    const int64_t projection_work = routes * N;
+    if constexpr (kProfile) {
+      profile->w2_routes = true;
+      profile->record(3);
+    }
+#if defined(_OPENMP) && AT_PARALLEL_OPENMP
+    // W13's ATen region has already initialized this thread's OpenMP settings.
+    work.run_openmp(
+        projection_work, stage2_work,
+        !at::in_parallel_region() && at::get_num_threads() > 1);
+#else
+    at::parallel_for(
+        0, projection_work, stage2_grain, [&](int64_t begin, int64_t end) {
+          work.project(begin, end);
+        });
+    at::parallel_for(
+        0, stage2_work, stage2_grain, [&](int64_t begin, int64_t end) {
+          work.reduce(begin, end);
+        });
+#endif
+    if constexpr (kProfile) {
+      profile->record(4);
+    }
+    return output;
+  }
+  constexpr int64_t kW2OutputBlock = Nvfp4W2Routes::kOutputBlock;
   if constexpr (kProfile) {
     profile->record(3);
   }
@@ -1092,9 +1234,13 @@ fused_nvfp4_moe_swiglu_cpu_profile(
       x, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights,
       w13_output_scale, w2_output_scale, &profile);
   profile.record(5);
+  std::string w2_backend = profile.w2_backend;
+  if (profile.w2_routes) {
+    w2_backend += "/routes";
+  }
   return {
       output, std::vector<double>(profile.seconds.begin(), profile.seconds.end()),
-      profile.w13_backend, profile.w2_backend};
+      profile.w13_backend, w2_backend};
 }
 
 } // namespace fused_moe_nvfp4
