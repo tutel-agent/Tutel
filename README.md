@@ -64,6 +64,51 @@ row-tile comparison. The other tuning setting stays fixed during each comparison
 both flags can be used together. Effective bandwidth still counts logical
 weight+scale bytes, not scratch traffic or measured DRAM traffic.
 
+For target-side bottleneck evidence, run on Linux with a matching `perf` tool:
+
+```sh
+env TUTEL_NVFP4_ROW_TILE=1 TUTEL_NVFP4_W2_SCHEDULE=output \
+    OMP_NUM_THREADS=132 OMP_DYNAMIC=FALSE OMP_PLACES=cores OMP_PROC_BIND=spread \
+    python example.py --end-to-end --threads 132 --warmup 20 --iterations 10000 \
+    --diagnose-internal --profile-perf
+```
+
+`--profile-perf` attaches `perf stat` and `perf record` to the existing process,
+including its worker threads, in **separate** batches on the same tensors.
+Each batch has `--warmup` calls with events disabled, followed by `--iterations`
+ordinary operator calls between acknowledged enable/disable commands. Input
+allocation, correctness, native phase profiling, and report generation are
+outside the collection windows. Ordinary latency is measured before perf starts.
+Profiling includes Python dispatch, OpenMP spinning, and small control-boundary
+overhead; do not treat its batch durations as uninstrumented latency.
+
+A new `nvfp4-perf-*` directory contains `stat.txt` (counts/IPC), `hotspots.txt`
+(user-space cycle samples by shared library/symbol), `cpu-hotspots.txt`
+(samples broken down by CPU/task/symbol), `perf.data` (for further
+`perf report`/`perf annotate` analysis), and `metadata.json` (backend, baseline,
+commands, batch durations, thread affinity masks and CPU/NUMA topology).
+Use `--perf-output NEW_DIRECTORY` to choose its location; existing directories
+are not overwritten. Sampling is 99 Hz per active thread without call stacks.
+Keep the native extension binary associated with `perf.data` for symbol analysis.
+No native rebuild is needed when the existing internal profiler is available.
+
+Generic cache events do not measure DRAM bandwidth or remote-NUMA traffic, and
+low aggregate IPC alone does not identify a memory bottleneck. Affinity masks
+also include idle threads and are not proof of active core usage. `perf stat`'s
+wall-clock elapsed time may include disabled setup/warmup; the gated loop
+duration is recorded separately in metadata. Check unsupported/not-counted
+events, multiplexing percentages, and any lost-sample/throttling warnings before
+interpreting results. Such warnings mark the capture as partial in metadata.
+Hotspot percentages aggregate worker CPU cycles, not shares of end-to-end wall
+time; a high OpenMP spin fraction alone does not quantify barrier latency.
+
+Missing perf, insufficient PMU permissions, unsupported control options, and
+timeouts are reported explicitly; logs and incomplete metadata are retained.
+The script does not install perf, elevate privileges, alter
+`perf_event_paranoid`, change affinity, or fetch external debug symbols. Ask the
+machine administrator for appropriate profiling access if perf is denied.
+Use a fixed kernel mode: A/B comparison flags cannot be combined with this option.
+
 > [!TIP]
 > #### Steps for Kimi-K3/GLM-5.x (Claude-Code Mode):
 >

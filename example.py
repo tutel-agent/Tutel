@@ -118,6 +118,15 @@ def parse_args():
         help="For --end-to-end, alternate output/routes W2 scheduling on the same tensors.",
     )
     parser.add_argument(
+        "--profile-perf",
+        action="store_true",
+        help="For --end-to-end on Linux, collect gated perf counters and native hotspots.",
+    )
+    parser.add_argument(
+        "--perf-output",
+        help="New directory for --profile-perf evidence (default: unique nvfp4-perf-* directory).",
+    )
+    parser.add_argument(
         "--small",
         action="store_true",
         help="Use mode-specific small dimensions for a quick correctness run.",
@@ -132,6 +141,12 @@ def validate_args(args):
         raise ValueError("--compare-row-tiles requires --end-to-end")
     if args.compare_w2_schedules and not args.end_to_end:
         raise ValueError("--compare-w2-schedules requires --end-to-end")
+    if args.profile_perf and not args.end_to_end:
+        raise ValueError("--profile-perf requires --end-to-end")
+    if args.perf_output is not None and not args.profile_perf:
+        raise ValueError("--perf-output requires --profile-perf")
+    if args.profile_perf and (args.compare_row_tiles or args.compare_w2_schedules):
+        raise ValueError("--profile-perf requires a fixed mode; run A/B comparisons separately")
     if args.experts is None:
         args.experts = 896 if args.end_to_end_mxfp4 else 256
     if args.topk is None:
@@ -808,6 +823,13 @@ def diagnose_nvfp4_internal(args, tensors):
     )
 
 
+def nvfp4_weight_scale_bytes(tensors):
+    return tensors[5].numel() * sum(
+        tensor.numel() * tensor.element_size() // tensor.size(0)
+        for tensor in tensors[1:5]
+    )
+
+
 def compare_nvfp4_row_tiles(args, tensors):
     compare_nvfp4_modes(args, tensors, row_tiles=True)
 
@@ -881,10 +903,7 @@ def compare_nvfp4_modes(args, tensors, *, row_tiles):
         else:
             os.environ[env_name] = original_mode
 
-    bytes_read = tensors[5].numel() * sum(
-        tensor.numel() * tensor.element_size() // tensor.size(0)
-        for tensor in tensors[1:5]
-    )
+    bytes_read = nvfp4_weight_scale_bytes(tensors)
     print(
         "{}: same process/tensors, alternating {}->{} / {}->{}, "
         "{} samples per mode, uninstrumented calls".format(
@@ -907,6 +926,26 @@ def compare_nvfp4_modes(args, tensors, *, row_tiles):
         "{} faster in {}/{} pairs; outputs match.".format(
             *names, statistics.median(ratios), names[1], wins, args.iterations
         )
+    )
+
+
+def profile_nvfp4_perf(args, tensors, baseline_median):
+    from nvfp4_perf import profile_operator
+
+    scalar_args = (args.w13_output_scale, args.w2_output_scale)
+    _, _, w13_backend, w2_backend = (
+        torch.ops.tutel_ops.fused_nvfp4_moe_swiglu_cpu_profile(*tensors, *scalar_args)
+    )
+    op = torch.ops.tutel_ops.fused_nvfp4_moe_swiglu_cpu
+    profile_operator(
+        lambda: op(*tensors, *scalar_args), args.warmup, args.iterations,
+        args.perf_output, {
+            "args": vars(args), "torch_version": torch.__version__,
+            "parallel_info": torch.__config__.parallel_info(),
+            "w13_backend": w13_backend, "w2_backend": w2_backend,
+            "uninstrumented_median_seconds": baseline_median,
+            "logical_weight_scale_bytes": nvfp4_weight_scale_bytes(tensors),
+        },
     )
 
 
@@ -1167,6 +1206,12 @@ def run_end_to_end(args):
         compare_nvfp4_row_tiles(args, tensors)
     if args.compare_w2_schedules:
         compare_nvfp4_w2_schedules(args, tensors)
+    if args.profile_perf:
+        try:
+            profile_nvfp4_perf(args, tensors, median)
+        except (OSError, RuntimeError) as exc:
+            print("error: perf capture failed: {}".format(exc), file=sys.stderr)
+            return 2
     print("Checksum: {:.9g}".format(output.float().sum().item()))
     return 0
 
@@ -1175,9 +1220,13 @@ def main():
     args = parse_args()
     try:
         validate_args(args)
+        if args.profile_perf:
+            from nvfp4_perf import require_perf
+            require_perf()
         load_extension()
         if (
-            args.diagnose_internal or args.compare_row_tiles or args.compare_w2_schedules
+            args.diagnose_internal or args.compare_row_tiles
+            or args.compare_w2_schedules or args.profile_perf
         ) and not hasattr(
             torch.ops.tutel_ops, "fused_nvfp4_moe_swiglu_cpu_profile"
         ):
