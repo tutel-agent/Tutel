@@ -74,17 +74,17 @@ def parse_args():
     mode.add_argument(
         "--w2",
         action="store_true",
-        help="Run W2 with per-expert activations; defaults to N=7168 and K=2048.",
+        help="Run W2 with per-expert activations; defaults to N=4096 and K=2048.",
     )
     mode.add_argument(
         "--w2-reduce",
         action="store_true",
-        help="Run W2 and FP32 routing-weight reduction; defaults to N=7168 and K=2048.",
+        help="Run W2 and FP32 routing-weight reduction; defaults to N=4096 and K=2048.",
     )
     mode.add_argument(
         "--end-to-end",
         action="store_true",
-        help="Run single-call W13+SwiGLU+W2+top-k reduction (default K=7168, I=2048, N=7168).",
+        help="Run single-call W13+SwiGLU+W2+top-k reduction (default K=4096, I=2048, N=4096).",
     )
     mode.add_argument(
         "--end-to-end-mxfp4",
@@ -120,12 +120,12 @@ def validate_args(args):
         if args.end_to_end_mxfp4:
             args.output_dim = 3584
         else:
-            args.output_dim = 7168 if args.w2 or args.w2_reduce or args.end_to_end else 4096
+            args.output_dim = 4096
     if args.input_dim is None:
         if args.end_to_end_mxfp4:
             args.input_dim = 3584
         else:
-            args.input_dim = 2048 if args.w2 or args.w2_reduce else 7168
+            args.input_dim = 2048 if args.w2 or args.w2_reduce else 4096
     if args.small:
         if args.end_to_end_mxfp4:
             (

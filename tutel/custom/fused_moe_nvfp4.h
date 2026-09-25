@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -242,38 +243,68 @@ struct Nvfp4PreparedActivations {
   std::vector<float> even;
   std::vector<float> odd;
 
+  static float vector_activation_limit(int64_t activation_k) {
+    // Bound the absolute sum so vector lane grouping cannot overflow where
+    // scalar-order activation * (FP4 * E4M3FN) accumulation stays finite.
+    const double maximum_dot_term =
+        6.0 * 448.0 * static_cast<double>(activation_k);
+    return static_cast<float>(
+        static_cast<double>(std::numeric_limits<float>::max()) /
+        maximum_dot_term);
+  }
+
+  static bool vector_value_is_safe(
+      c10::BFloat16 activation, float safe_activation) {
+    const float value = static_cast<float>(activation);
+    return std::isfinite(value) && std::abs(value) <= safe_activation;
+  }
+
+  static bool vector_values_are_safe(
+      const c10::BFloat16* activation,
+      int64_t activation_rows,
+      int64_t activation_k) {
+    const float safe_activation = vector_activation_limit(activation_k);
+    for (int64_t index = 0; index < activation_rows * activation_k; ++index) {
+      if (!vector_value_is_safe(activation[index], safe_activation)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Nvfp4PreparedActivations(
+      int64_t activation_rows,
+      int64_t activation_k,
+      bool vector_values_safe = true)
+      : rows(activation_rows), K(activation_k), packed_k(activation_k / 2)
+#if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
+      , use_avx512_bf16(
+          vector_values_safe && activation_k % 32 == 0 &&
+          nvfp4_cpu_supports_avx512_bf16())
+#endif
+#if TUTEL_NVFP4_AVX2_AVAILABLE
+      , use_avx2(vector_values_safe && nvfp4_cpu_supports_avx2_fma())
+#endif
+  {
+#if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
+    if (use_avx512_bf16) {
+      avx512_bf16.resize(rows * K);
+      return;
+    }
+#endif
+    even.resize(rows * packed_k);
+    odd.resize(rows * packed_k);
+  }
+
   Nvfp4PreparedActivations(
       const c10::BFloat16* activation,
       int64_t activation_rows,
       int64_t activation_k)
-      : rows(activation_rows), K(activation_k), packed_k(activation_k / 2)
+      : Nvfp4PreparedActivations(
+          activation_rows, activation_k,
+          vector_values_are_safe(activation, activation_rows, activation_k)) {
 #if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
-      , use_avx512_bf16(
-          activation_k % 32 == 0 && nvfp4_cpu_supports_avx512_bf16())
-#endif
-#if TUTEL_NVFP4_AVX2_AVAILABLE
-      , use_avx2(nvfp4_cpu_supports_avx2_fma())
-#endif
-  {
-    // Bound the absolute sum so vector lane grouping cannot overflow where
-    // scalar-order activation * (FP4 * E4M3FN) accumulation stays finite.
-    const double maximum_dot_term =
-        6.0 * 448.0 * static_cast<double>(K);
-    const float safe_activation = static_cast<float>(
-        static_cast<double>(std::numeric_limits<float>::max()) /
-        maximum_dot_term);
-    bool vector_values_safe = true;
-    for (int64_t index = 0; index < rows * K; ++index) {
-      const float value = static_cast<float>(activation[index]);
-      if (!std::isfinite(value) || std::abs(value) > safe_activation) {
-        vector_values_safe = false;
-        break;
-      }
-    }
-#if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
-    use_avx512_bf16 = use_avx512_bf16 && vector_values_safe;
     if (use_avx512_bf16) {
-      avx512_bf16.resize(rows * K);
       for (int64_t row = 0; row < rows; ++row) {
         const int64_t row_offset = row * K;
         for (int64_t k = 0; k < K; k += 32) {
@@ -288,11 +319,6 @@ struct Nvfp4PreparedActivations {
       return;
     }
 #endif
-#if TUTEL_NVFP4_AVX2_AVAILABLE
-    use_avx2 = use_avx2 && vector_values_safe;
-#endif
-    even.resize(rows * packed_k);
-    odd.resize(rows * packed_k);
     for (int64_t row = 0; row < rows; ++row) {
       const int64_t source_offset = row * K;
       const int64_t target_offset = row * packed_k;
@@ -303,6 +329,41 @@ struct Nvfp4PreparedActivations {
             static_cast<float>(activation[source_offset + 2 * p + 1]);
       }
     }
+  }
+
+  inline void store(int64_t row, int64_t k, c10::BFloat16 value) {
+#if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
+    if (use_avx512_bf16) {
+      const int64_t permuted_k = (k / 32) * 32 + (k % 32) / 2 + (k % 2) * 16;
+      avx512_bf16[row * K + permuted_k] = value;
+      return;
+    }
+#endif
+    (k % 2 == 0 ? even : odd)[row * packed_k + k / 2] =
+        static_cast<float>(value);
+  }
+
+  void disable_vector_paths() {
+#if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
+    if (use_avx512_bf16) {
+      even.resize(rows * packed_k);
+      odd.resize(rows * packed_k);
+      for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t k = 0; k < K; k += 32) {
+          for (int64_t i = 0; i < 16; ++i) {
+            even[row * packed_k + k / 2 + i] =
+                static_cast<float>(avx512_bf16[row * K + k + i]);
+            odd[row * packed_k + k / 2 + i] =
+                static_cast<float>(avx512_bf16[row * K + k + 16 + i]);
+          }
+        }
+      }
+      use_avx512_bf16 = false;
+    }
+#endif
+#if TUTEL_NVFP4_AVX2_AVAILABLE
+    use_avx2 = false;
+#endif
   }
 
   inline float dot(
@@ -722,9 +783,10 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu(
   const uint8_t* w13_scale_data = w13_scale.data_ptr<uint8_t>();
   const int64_t w13_packed_k = K / 2;
   const int64_t w13_scale_k = K / 16;
-  auto hidden = torch::empty(
-      {routes, I}, x.options().dtype(torch::kBFloat16));
-  c10::BFloat16* hidden_data = hidden.data_ptr<c10::BFloat16>();
+  Nvfp4PreparedActivations prepared_hidden(routes, I);
+  const float hidden_activation_limit =
+      Nvfp4PreparedActivations::vector_activation_limit(I);
+  std::atomic<bool> hidden_values_safe{true};
 
   // Keep gate and up reads contiguous within a block without adding a second
   // OpenMP region for a cache-resident elementwise SwiGLU pass.
@@ -735,6 +797,7 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu(
           std::max<int64_t>(1, static_cast<int64_t>(at::get_num_threads())));
   at::parallel_for(0, stage1_work, stage1_grain, [&](int64_t begin, int64_t end) {
     std::array<float, kW13RowBlock> gate_values;
+    bool local_hidden_values_safe = true;
     int64_t position = begin;
     while (position < end) {
       const int64_t route = position / I;
@@ -763,16 +826,26 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu(
               token,
               w13_data + row * w13_packed_k,
               w13_scale_data + row * w13_scale_k);
-          hidden_data[route * I + i] = c10::BFloat16(
+          const c10::BFloat16 hidden_value(
               nvfp4_silu(gate_values[i - block_begin]) * up);
+          prepared_hidden.store(route, i, hidden_value);
+          if (!Nvfp4PreparedActivations::vector_value_is_safe(
+                  hidden_value, hidden_activation_limit)) {
+            local_hidden_values_safe = false;
+          }
         }
       }
       position = segment_end;
     }
+    if (!local_hidden_values_safe) {
+      hidden_values_safe.store(false, std::memory_order_relaxed);
+    }
   });
 
-  // Returning from the W13 region is the only required stage barrier.
-  const Nvfp4PreparedActivations prepared_hidden(hidden_data, routes, I);
+  // W13 writes the W2 layout directly; only unsafe values need a conversion.
+  if (!hidden_values_safe.load(std::memory_order_relaxed)) {
+    prepared_hidden.disable_vector_paths();
+  }
   const uint8_t* w2_data = w2.data_ptr<uint8_t>();
   const uint8_t* w2_scale_data = w2_scale.data_ptr<uint8_t>();
   const int64_t w2_packed_k = I / 2;
