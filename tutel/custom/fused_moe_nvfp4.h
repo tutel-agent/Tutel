@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -122,6 +123,30 @@ inline bool nvfp4_cpu_supports_avx512_bf16() {
       __builtin_cpu_supports("fma");
 }
 
+TUTEL_NVFP4_AVX512_BF16_TARGET inline __m512 nvfp4_accumulate_avx512_bf16(
+    __m512 sum,
+    __m512i activation_bits,
+    const uint8_t* packed_weight,
+    const uint8_t* scale,
+    __m256i nibble_mask,
+    __m512i e2m1_lut,
+    const float* scale_lut) {
+  const __m128i packed =
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed_weight));
+  const __m256i packed_16 = _mm256_cvtepu8_epi16(packed);
+  const __m256i even_indices = _mm256_and_si256(packed_16, nibble_mask);
+  const __m256i odd_indices = _mm256_srli_epi16(packed_16, 4);
+  __m512i indices = _mm512_castsi256_si512(even_indices);
+  indices = _mm512_inserti64x4(indices, odd_indices, 1);
+  const __m512i weight_bits = _mm512_permutexvar_epi16(indices, e2m1_lut);
+  const __m512 contribution = _mm512_dpbf16_ps(
+      _mm512_setzero_ps(), (__m512bh)activation_bits, (__m512bh)weight_bits);
+  const __m512 scale0 = _mm512_set1_ps(scale_lut[scale[0]]);
+  const __m512 scale1 = _mm512_set1_ps(scale_lut[scale[1]]);
+  const __m512 scale_pattern = _mm512_mask_blend_ps(0xf0f0, scale0, scale1);
+  return _mm512_fmadd_ps(contribution, scale_pattern, sum);
+}
+
 TUTEL_NVFP4_AVX512_BF16_TARGET inline float nvfp4_dot_avx512_bf16(
     const c10::BFloat16* activation_permuted,
     const uint8_t* packed_weight,
@@ -133,25 +158,61 @@ TUTEL_NVFP4_AVX512_BF16_TARGET inline float nvfp4_dot_avx512_bf16(
   __m512 sum = _mm512_setzero_ps();
 
   for (int64_t p = 0; p < packed_k; p += 16) {
-    const __m128i packed =
-        _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed_weight + p));
-    const __m256i packed_16 = _mm256_cvtepu8_epi16(packed);
-    const __m256i even_indices = _mm256_and_si256(packed_16, nibble_mask);
-    const __m256i odd_indices = _mm256_srli_epi16(packed_16, 4);
-    __m512i indices = _mm512_castsi256_si512(even_indices);
-    indices = _mm512_inserti64x4(indices, odd_indices, 1);
-    const __m512i weight_bits = _mm512_permutexvar_epi16(indices, e2m1_lut);
     const __m512i activation_bits = _mm512_loadu_si512(
         reinterpret_cast<const void*>(activation_permuted + 2 * p));
-    const __m512 contribution = _mm512_dpbf16_ps(
-        _mm512_setzero_ps(), (__m512bh)activation_bits, (__m512bh)weight_bits);
-
-    const __m512 scale0 = _mm512_set1_ps(scale_lut[scale[p / 8]]);
-    const __m512 scale1 = _mm512_set1_ps(scale_lut[scale[p / 8 + 1]]);
-    const __m512 scale_pattern = _mm512_mask_blend_ps(0xf0f0, scale0, scale1);
-    sum = _mm512_fmadd_ps(contribution, scale_pattern, sum);
+    sum = nvfp4_accumulate_avx512_bf16(
+        sum, activation_bits, packed_weight + p, scale + p / 8,
+        nibble_mask, e2m1_lut, scale_lut.data());
   }
   return _mm512_reduce_add_ps(sum);
+}
+
+TUTEL_NVFP4_AVX512_BF16_TARGET inline void nvfp4_dot_rows_avx512_bf16(
+    const c10::BFloat16* activation_permuted,
+    const uint8_t* packed_weight,
+    const uint8_t* scale,
+    int64_t packed_k,
+    int64_t row_count,
+    float* output) {
+  const __m256i nibble_mask = _mm256_set1_epi16(0x0f);
+  const __m512i e2m1_lut = _mm512_load_si512(kNvfp4E2m1Bf16.data());
+  const float* scale_lut = nvfp4_e4m3fn_lut().data();
+  const int64_t scale_k = packed_k / 8;
+  int64_t row = 0;
+  for (; row + 4 <= row_count; row += 4) {
+    const uint8_t* weight0 = packed_weight + row * packed_k;
+    const uint8_t* scale0 = scale + row * scale_k;
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    __m512 sum2 = _mm512_setzero_ps();
+    __m512 sum3 = _mm512_setzero_ps();
+    // Interleave independent rows without reassociating any row's K sum.
+    for (int64_t p = 0; p < packed_k; p += 16) {
+      const __m512i activation_bits = _mm512_loadu_si512(
+          reinterpret_cast<const void*>(activation_permuted + 2 * p));
+      sum0 = nvfp4_accumulate_avx512_bf16(
+          sum0, activation_bits, weight0 + p, scale0 + p / 8,
+          nibble_mask, e2m1_lut, scale_lut);
+      sum1 = nvfp4_accumulate_avx512_bf16(
+          sum1, activation_bits, weight0 + packed_k + p, scale0 + scale_k + p / 8,
+          nibble_mask, e2m1_lut, scale_lut);
+      sum2 = nvfp4_accumulate_avx512_bf16(
+          sum2, activation_bits, weight0 + 2 * packed_k + p,
+          scale0 + 2 * scale_k + p / 8, nibble_mask, e2m1_lut, scale_lut);
+      sum3 = nvfp4_accumulate_avx512_bf16(
+          sum3, activation_bits, weight0 + 3 * packed_k + p,
+          scale0 + 3 * scale_k + p / 8, nibble_mask, e2m1_lut, scale_lut);
+    }
+    output[row] = _mm512_reduce_add_ps(sum0);
+    output[row + 1] = _mm512_reduce_add_ps(sum1);
+    output[row + 2] = _mm512_reduce_add_ps(sum2);
+    output[row + 3] = _mm512_reduce_add_ps(sum3);
+  }
+  for (; row < row_count; ++row) {
+    output[row] = nvfp4_dot_avx512_bf16(
+        activation_permuted, packed_weight + row * packed_k,
+        scale + row * scale_k, packed_k);
+  }
 }
 #endif
 
@@ -282,6 +343,7 @@ struct Nvfp4PreparedActivations {
   int64_t rows;
   int64_t K;
   int64_t packed_k;
+  int64_t row_tile;
 #if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
   bool use_avx512_bf16;
   std::vector<c10::BFloat16> avx512_bf16;
@@ -295,8 +357,10 @@ struct Nvfp4PreparedActivations {
   Nvfp4PreparedActivations(
       const c10::BFloat16* activation,
       int64_t activation_rows,
-      int64_t activation_k)
-      : rows(activation_rows), K(activation_k), packed_k(activation_k / 2)
+      int64_t activation_k,
+      int64_t activation_row_tile = 1)
+      : rows(activation_rows), K(activation_k), packed_k(activation_k / 2),
+        row_tile(activation_row_tile)
 #if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
       , use_avx512_bf16(
           activation_k % 32 == 0 && nvfp4_cpu_supports_avx512_bf16())
@@ -354,7 +418,7 @@ struct Nvfp4PreparedActivations {
   const char* backend_name() const {
 #if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
     if (use_avx512_bf16) {
-      return "AVX512-BF16";
+      return row_tile == 4 ? "AVX512-BF16/rows4" : "AVX512-BF16";
     }
 #endif
 #if TUTEL_NVFP4_AVX2_AVAILABLE
@@ -363,6 +427,14 @@ struct Nvfp4PreparedActivations {
     }
 #endif
     return "scalar";
+  }
+
+  bool uses_row_tile() const {
+#if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
+    return use_avx512_bf16 && row_tile == 4;
+#else
+    return false;
+#endif
   }
 
   inline float dot(
@@ -387,6 +459,24 @@ struct Nvfp4PreparedActivations {
         even.data() + row * packed_k,
         odd.data() + row * packed_k,
         weight, scale, packed_k);
+  }
+
+  inline void dot_rows(
+      int64_t row,
+      const uint8_t* weight,
+      const uint8_t* scale,
+      int64_t row_count,
+      float* output) const {
+#if TUTEL_NVFP4_AVX512_BF16_AVAILABLE
+    if (uses_row_tile()) {
+      nvfp4_dot_rows_avx512_bf16(
+          avx512_bf16.data() + row * K, weight, scale, packed_k, row_count, output);
+      return;
+    }
+#endif
+    for (int64_t n = 0; n < row_count; ++n) {
+      output[n] = dot(row, weight + n * packed_k, scale + n * (K / 16));
+    }
   }
 };
 
@@ -612,6 +702,17 @@ inline torch::Tensor nvfp4_batched_gemv_w2_reduce_cpu(
       "tutel_ops::nvfp4_batched_gemv_w2_reduce");
 }
 
+inline int64_t nvfp4_fused_row_tile() {
+  const char* value = std::getenv("TUTEL_NVFP4_ROW_TILE");
+  if (value == nullptr || std::strcmp(value, "1") == 0) {
+    return 1;
+  }
+  TORCH_CHECK(
+      std::strcmp(value, "4") == 0,
+      "TUTEL_NVFP4_ROW_TILE must be 1 or 4, got '", value, "'");
+  return 4;
+}
+
 struct Nvfp4MoeProfile {
   using Clock = std::chrono::steady_clock;
   Clock::time_point last;
@@ -641,6 +742,7 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu_impl(
   if constexpr (kProfile) {
     profile->last = Nvfp4MoeProfile::Clock::now();
   }
+  const int64_t row_tile = nvfp4_fused_row_tile();
   TORCH_CHECK(x.device().is_cpu(), "x must be a CPU tensor");
   TORCH_CHECK(w13.device().is_cpu(), "w13 must be a CPU tensor");
   TORCH_CHECK(w13_scale.device().is_cpu(), "w13_scale must be a CPU tensor");
@@ -796,7 +898,7 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu_impl(
   }
 
   const Nvfp4PreparedActivations prepared_x(
-      x.data_ptr<c10::BFloat16>(), M, K);
+      x.data_ptr<c10::BFloat16>(), M, K, row_tile);
   const uint8_t* w13_data = w13.data_ptr<uint8_t>();
   const uint8_t* w13_scale_data = w13_scale.data_ptr<uint8_t>();
   const int64_t w13_packed_k = K / 2;
@@ -832,6 +934,26 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu_impl(
            block_begin += kW13RowBlock) {
         const int64_t block_end =
             std::min<int64_t>(intermediate_end, block_begin + kW13RowBlock);
+        if (prepared_x.uses_row_tile()) {
+          const int64_t row = expert_row + block_begin;
+          const int64_t block_size = block_end - block_begin;
+          std::array<float, kW13RowBlock> up_values;
+          prepared_x.dot_rows(
+              token, w13_data + row * w13_packed_k,
+              w13_scale_data + row * w13_scale_k,
+              block_size, gate_values.data());
+          prepared_x.dot_rows(
+              token, w13_data + (row + I) * w13_packed_k,
+              w13_scale_data + (row + I) * w13_scale_k,
+              block_size, up_values.data());
+          for (int64_t i = 0; i < block_size; ++i) {
+            const float gate = w13_output_scale_f * gate_values[i];
+            const float up = w13_output_scale_f * up_values[i];
+            hidden_data[route * I + block_begin + i] =
+                c10::BFloat16(nvfp4_silu(gate) * up);
+          }
+          continue;
+        }
         for (int64_t i = block_begin; i < block_end; ++i) {
           const int64_t row = expert_row + i;
           gate_values[i - block_begin] =
@@ -858,7 +980,7 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu_impl(
   }
 
   // Returning from the W13 region is the only required stage barrier.
-  const Nvfp4PreparedActivations prepared_hidden(hidden_data, routes, I);
+  const Nvfp4PreparedActivations prepared_hidden(hidden_data, routes, I, row_tile);
   if constexpr (kProfile) {
     profile->w2_backend = prepared_hidden.backend_name();
     profile->record(2);
@@ -881,6 +1003,7 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu_impl(
   }
   at::parallel_for(0, stage2_work, stage2_grain, [&](int64_t begin, int64_t end) {
     std::array<float, kW2OutputBlock> accumulator;
+    std::array<float, kW2OutputBlock> projections;
     int64_t position = begin;
     while (position < end) {
       const int64_t token = position / N;
@@ -902,6 +1025,19 @@ inline torch::Tensor fused_nvfp4_moe_swiglu_cpu_impl(
           const int64_t expert = route_ids[route];
           const float routing_weight = route_weights[route];
           const int64_t expert_row = expert * N;
+          if (prepared_hidden.uses_row_tile()) {
+            const int64_t row = expert_row + block_begin;
+            prepared_hidden.dot_rows(
+                route, w2_data + row * w2_packed_k,
+                w2_scale_data + row * w2_scale_k,
+                block_end - block_begin, projections.data());
+            for (int64_t n = block_begin; n < block_end; ++n) {
+              const float projected =
+                  w2_output_scale_f * projections[n - block_begin];
+              accumulator[n - block_begin] += routing_weight * projected;
+            }
+            continue;
+          }
           for (int64_t n = block_begin; n < block_end; ++n) {
             const int64_t row = expert_row + n;
             const float projected = w2_output_scale_f * prepared_hidden.dot(

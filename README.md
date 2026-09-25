@@ -26,6 +26,15 @@ W13 and W2. The ordinary benchmark has no timing instrumentation; the internal
 profile excludes dispatcher, result packaging, and Python overhead. Unlike
 `--diagnose-stages`, these are phases of the fused call, not standalone timings.
 
+Set `TUTEL_NVFP4_ROW_TILE=4` to try the four-row AVX512-BF16 kernel in the fused
+NVFP4 operator. It shares activation loads across consecutive output rows while
+preserving each row's accumulation order and the routing reduction order.
+`TUTEL_NVFP4_ROW_TILE=1` (the default) retains the single-row loops for same-build
+A/B comparisons. The internal profile reports `AVX512-BF16/rows4` when this path
+is selected; short tails use single-row dots. AVX2, scalar, and unsafe-value
+fallbacks remain unchanged. Standalone stage operators remain single-row
+references. Rebuild the extension before using this option.
+
 > [!TIP]
 > #### Steps for Kimi-K3/GLM-5.x (Claude-Code Mode):
 >
