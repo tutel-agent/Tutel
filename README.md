@@ -2,6 +2,23 @@
 
 Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parallel solution proposing ["No-penalty Parallism/Sparsity/Capacity/.. Switching"](https://mlsys.org/media/mlsys-2023/Slides/2477.pdf) for modern training and inference that have dynamic behaviors. Support direct NVFP4/MXFP4/BlockwiseFP8 Inference for MoE-based GLM-5.x / DeepSeek-3.x / Kimi-2.x / Kimi-3.x / Qwen3 / Gpt-OSS using A100/A800/H100/MI300/..
 
+## Optional CPU NVFP4/MXFP4 MoE operators
+
+The CPU MoE custom operators are disabled by default. Build them explicitly on
+Linux with:
+
+```sh
+NO_CUDA=1 python setup.py build_ext --inplace --force --enable_cpu_moe
+```
+
+This enables:
+
+- `tutel_ops::fused_nvfp4_moe_swiglu_cpu(x, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, w13_output_scale, w2_output_scale)`: packed E2M1 with raw group-16 E4M3FN scales.
+- `tutel_ops::fused_mxfp4_moe_situ_cpu(x, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights)`: Kimi K3 packed E2M1 with group-32 E8M0 scales (`2 ** (byte - 127)`) and SiTU-GLU.
+
+Run `python example.py --end-to-end --small` or
+`python example.py --end-to-end-mxfp4 --small` after building.
+
 > [!TIP]
 > #### Steps for Kimi-K3/GLM-5.x (Claude-Code Mode):
 >

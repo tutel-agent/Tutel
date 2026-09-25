@@ -2,9 +2,15 @@
 // Licensed under the MIT license.
 
 #include <torch/extension.h>
+#ifdef TUTEL_ENABLE_CPU_MOE
+#include "fused_moe_nvfp4.h"
+#include "fused_moe_mxfp4.h"
+#endif
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupGloo.hpp>
 #include <torch/csrc/distributed/c10d/TCPStore.hpp>
+
+#include <cstdint>
 
 #if defined(USE_GPU)
 #include <ATen/cuda/CUDAContext.h>
@@ -770,6 +776,51 @@ static torch::Tensor nccl_all_to_all_2d_async(torch::Tensor &input) {
   }
 }
 
+#endif
+
+#ifdef TUTEL_ENABLE_CPU_MOE
+TORCH_LIBRARY(tutel_ops, m) {
+  m.def(
+      "nvfp4_batched_gemv(Tensor A_cpu, Tensor W_cpu, Tensor W_scale_cpu, "
+      "Tensor expert_ids_cpu, float output_scale) -> Tensor");
+  m.def(
+      "nvfp4_batched_gemv_swiglu(Tensor A_cpu, Tensor W13_cpu, "
+      "Tensor W13_scale_cpu, Tensor expert_ids_cpu, float output_scale) -> Tensor");
+  m.def(
+      "nvfp4_batched_gemv_w2(Tensor A_cpu, Tensor W2_cpu, "
+      "Tensor W2_scale_cpu, Tensor expert_ids_cpu, float output_scale) -> Tensor");
+  m.def(
+      "nvfp4_batched_gemv_w2_reduce(Tensor A_cpu, Tensor W2_cpu, "
+      "Tensor W2_scale_cpu, Tensor expert_ids_cpu, Tensor expert_weights_cpu, "
+      "float output_scale) -> Tensor");
+  m.def(
+      "fused_nvfp4_moe_swiglu_cpu(Tensor x, Tensor w13, Tensor w13_scale, "
+      "Tensor w2, Tensor w2_scale, Tensor topk_ids, Tensor topk_weights, "
+      "float w13_output_scale, float w2_output_scale) -> Tensor");
+  m.def(
+      "fused_mxfp4_moe_situ_cpu(Tensor x, Tensor w13, Tensor w13_scale, "
+      "Tensor w2, Tensor w2_scale, Tensor topk_ids, Tensor topk_weights) "
+      "-> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(tutel_ops, CPU, m) {
+  m.impl("nvfp4_batched_gemv", TORCH_FN(tutel::fused_moe_nvfp4::nvfp4_batched_gemv_cpu));
+  m.impl(
+      "nvfp4_batched_gemv_swiglu",
+      TORCH_FN(tutel::fused_moe_nvfp4::nvfp4_batched_gemv_swiglu_cpu));
+  m.impl(
+      "nvfp4_batched_gemv_w2",
+      TORCH_FN(tutel::fused_moe_nvfp4::nvfp4_batched_gemv_w2_cpu));
+  m.impl(
+      "nvfp4_batched_gemv_w2_reduce",
+      TORCH_FN(tutel::fused_moe_nvfp4::nvfp4_batched_gemv_w2_reduce_cpu));
+  m.impl(
+      "fused_nvfp4_moe_swiglu_cpu",
+      TORCH_FN(tutel::fused_moe_nvfp4::fused_nvfp4_moe_swiglu_cpu));
+  m.impl(
+      "fused_mxfp4_moe_situ_cpu",
+      TORCH_FN(tutel::fused_moe_mxfp4::fused_mxfp4_moe_situ_cpu));
+}
 #endif
 
 
@@ -1681,7 +1732,7 @@ torch::Tensor warp_gemm_nt_bf16xfp8_block_scal(const torch::Tensor &x, const tor
 #endif
 
 
-TORCH_LIBRARY(tutel_ops, m) {
+TORCH_LIBRARY_FRAGMENT(tutel_ops, m) {
   m.def("cumsum", warp_cumsum);
   m.def("sparse_bmm_infer", warp_sparse_bmm_infer);
 
