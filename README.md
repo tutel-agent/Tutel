@@ -35,6 +35,16 @@ is selected; short tails use single-row dots. AVX2, scalar, and unsafe-value
 fallbacks remain unchanged. Standalone stage operators remain single-row
 references. Rebuild the extension before using this option.
 
+Use `python example.py --end-to-end --compare-row-tiles` for a same-process
+A/B comparison. It reuses the tensors and thread configuration, alternates
+single-row/four-row call order, and reports uninstrumented latency, effective
+bandwidth, and paired speedup. Each mode receives `--warmup` warmups and
+`--iterations` timed calls. Mode detection and full-output comparisons are
+outside timing, and the original environment setting is restored afterward.
+No four-row comparison is reported when both stages use fallback kernels.
+`--diagnose-internal` still measures a separate instrumented batch; its medians
+must not be subtracted from these A/B latencies to infer dispatcher overhead.
+
 > [!TIP]
 > #### Steps for Kimi-K3/GLM-5.x (Claude-Code Mode):
 >
