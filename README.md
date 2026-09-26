@@ -68,6 +68,9 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 > # Vision Example in the container (for GLM-5.3-Flash and Kimi-K3 only):
 > node-container:$ claude-unattended "What is shown in the picture at https://i0.hdslb.com/bfs/archive/14c094d92aabe3f9a5c4356a66a122fc335239f2.jpg"
 >
+> # Audio Example in the container (for Windows only):
+> node-container:$ claude-unattended # Press <Win> + <H> to input text from audio..
+>
 > # Text Example in the container:
 > node-container:$ claude-unattended "What time is it in PST?"
 > ```
