@@ -1307,6 +1307,12 @@ std::tuple<torch::Tensor, torch::Tensor> warp_multi_head_latent_rope_bf16_v5(
   return {qh.view({qh.size(0), -1, 3, 64}).view(torch::kInt32), q_output};
 }
 
+#if defined(__has_include)
+#if __has_include("extensions/azure_ext.h")
+#include "extensions/azure_ext.h"
+#endif
+#endif
+
 #if IS_NVIDIA_GPU == 0
 #if defined(__has_include)
 #if __has_include("extensions/mla_decode.h")
