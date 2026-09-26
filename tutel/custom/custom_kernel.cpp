@@ -26,9 +26,20 @@
 
 #include <regex>
 #include <vector>
+#include <cstdint>
 
 #if defined(__linux__)
 #include <sys/wait.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #undef CHECK_EQ
@@ -1018,26 +1029,6 @@ static void perform(FN func, int num_runs = 1000) {
   printf("Perform: %g\n", ab::convertToElapsedTime(h1, h2) / num_runs);
 }
 
-static void master_print(const std::vector<torch::Tensor> &xs, int64_t rank = -1) {
-  if (get_world_rank() != 0 && rank != 0)
-    return;
-  puts("=======================");
-  for (auto &x: xs) {
-    printf("[");
-    for (int i = 0; i < x.dim(); ++i) printf("%d, ", x.size(i));
-    printf("] (dtype_size = %d) data = ", int(torch::elementSize(torch::typeMetaToScalarType(x.dtype()))));
-    auto x_ = x.to(torch::kFloat32).to(torch::kCPU);
-    if (x.numel() > 10) {
-      for (int i = 0; i < 5; ++i) printf("%g, ", x_.data_ptr<float>()[i]);
-      printf("..");
-      for (int i = 0; i < 5; ++i) printf("%g, ", x_.data_ptr<float>()[x.numel() - 5 + i]);
-    } else {
-      for (int i = 0; i < x.numel(); ++i) printf("%g, ", x_.data_ptr<float>()[i]);
-    }
-    puts("");
-  }
-}
-
 
 std::tuple<torch::Tensor, torch::Tensor> warp_to_float8_block(torch::Tensor w) {
   CHECK_CUDA(w);
@@ -1681,7 +1672,7 @@ torch::Tensor warp_gemm_nt_bf16xfp8_block_scal(const torch::Tensor &x, const tor
 #endif
 
 
-TORCH_LIBRARY(tutel_ops, m) {
+TORCH_LIBRARY_FRAGMENT(tutel_ops, m) {
   m.def("cumsum", warp_cumsum);
   m.def("sparse_bmm_infer", warp_sparse_bmm_infer);
 
