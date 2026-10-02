@@ -81,7 +81,7 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 > sudo npm install -g @anthropic-ai/claude-code@2.1.199
 > curl -LO http://127.0.0.1:8000/claude.cmd
 >
-> ./claude.cmd
+> URL=http://127.0.0.1:8000 bash ./claude.cmd
 > ```
 > 
 > #### Agent Setup for Windows (>= 10.0):
@@ -91,7 +91,7 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 > npm install -g @anthropic-ai/claude-code@2.1.199
 > curl -LO http://127.0.0.1:8000/claude.cmd
 >
-> .\claude.cmd
+> setx URL http://127.0.0.1:8000 && .\claude.cmd
 > ```
 ------------------
 
