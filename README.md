@@ -15,15 +15,13 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 > 
 > | Azure GPU Type | ***vLLM/SGL*** | ***Tutel*** |
 > |  ----  | ----  | ----  |
-> | AMD MI300X + GLM-5.3 (750W x8) | 0 t/s (MTP=0, OoM) | 761 t/s (MTP=0, GPU=8, BSZ=32) |
-> | AMD MI300X + GLM-5.3-Flash (750W x1) | 0 t/s (MTP=0, OoM) | 108 t/s (MTP=0, GPU=1) |
+> | AMD MI300X (750W x8) + GLM-5.3 | 0 t/s (MTP=0, OoM) | 761 t/s (MTP=0, GPU=8, BSZ=32) |
+> | AMD MI300X (750W x1) + GLM-5.3-Flash | 0 t/s (MTP=0, OoM) | 108 t/s (MTP=0, GPU=1) |
 > |   | 0 t/s (MTP=4, OoM) | 225 t/s ×TAR (MTP=4, GPU=1) |
-> | AMD MI300X + Kimi K3 (750W x8) | 0 t/s (MTP=0, OoM) | 73.4 t/s (MTP=0, GPU=8) |
+> | AMD MI300X (750W x8) + Kimi K3 | 0 t/s (MTP=0, OoM) | 73.4 t/s (MTP=0, GPU=8) |
 > |   | 0 t/s (MTP=8, OoM) | 287.1 t/s ×TAR (MTP=8, GPU=8) |
-> | AMD MI325X + Kimi K3 (1000W x8) | 3.1 t/s (MTP=0)  | 82.0 t/s (MTP=0, GPU=8) |
+> | AMD MI325X (1000W x8) + Kimi K3 | 3.1 t/s (MTP=0)  | 82.0 t/s (MTP=0, GPU=8) |
 > |   | 0 t/s (MTP=8, OoM) | 315.2 t/s ×TAR (MTP=8, GPU=8) |
-> | AMD MI355X + Kimi K3 (1400W x8) | 43.5 t/s (MTP=0) | (TBD, no environment available) |
-> | NVIDIA B200 + Kimi K3 (1000W x8) | 0 t/s (MTP=0)  | (TBD, no environment available) |
 > 
 > 
 > #### Azure Service:
