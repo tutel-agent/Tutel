@@ -19,6 +19,10 @@ from setuptools import setup, find_packages, Command
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CppExtension
 
+ENABLE_CPU_MOE_OPTION = '--enable_cpu_moe'
+ENABLE_CPU_MOE = ENABLE_CPU_MOE_OPTION in sys.argv
+sys.argv = [arg for arg in sys.argv if arg != ENABLE_CPU_MOE_OPTION]
+
 try:
     from torch.utils.cpp_extension import IS_HIP_EXTENSION
 except:
@@ -57,12 +61,24 @@ class Tester(Command):
 
 def install(use_cuda, use_nccl):
     ext_libs = []
+    ext_link_args = []
+    ext_macros = []
+    ext_depends = []
     if pf.system() == 'Linux':
         ext_args = ['-w']
+        if ENABLE_CPU_MOE and torch.backends.openmp.is_available():
+            # ATen's OpenMP parallel_for is header-defined and requires _OPENMP
+            # in every extension translation unit that invokes it.
+            ext_args += ['-fopenmp']
+            ext_link_args += ['-fopenmp']
     elif pf.system() == 'Darwin':
         ext_args = ['-mmacosx-version-min=10.13']
     else:
         ext_args = []
+
+    if ENABLE_CPU_MOE:
+        ext_macros += [('TUTEL_ENABLE_CPU_MOE', '1')]
+        ext_depends += []
 
     if not use_cuda:
         use_nccl = False
@@ -128,7 +144,10 @@ def install(use_cuda, use_nccl):
             ],
             library_dirs=['/usr/local/cuda/lib64/stubs'],
             libraries=ext_libs,
-            extra_compile_args={'cxx': ext_args})
+            define_macros=ext_macros,
+            depends=ext_depends,
+            extra_compile_args={'cxx': ext_args},
+            extra_link_args=ext_link_args)
         ],
         cmdclass={
             'build_ext': BuildExtension,
@@ -150,4 +169,3 @@ if (torch.version.cuda or torch.version.hip) and int(os.environ.get('NO_CUDA', 0
 else:
     print('Installing without CUDA extension..')
     install(use_cuda=False, use_nccl=False)
-
