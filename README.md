@@ -63,18 +63,21 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 >
 > #### Agent Examples:
 > ```sh
-> # Vision Example in the container (for GLM-5.3-Flash and Kimi-K3 only):
+> # 📷 Vision Example in the container (for GLM-5.3-Flash and Kimi-K3 only):
 > node-container:$ claude-unattended "What is shown in the picture at https://i0.hdslb.com/bfs/archive/14c094d92aabe3f9a5c4356a66a122fc335239f2.jpg"
 >
-> # Audio Example in the container (for Windows only):
-> node-container:$ claude-unattended # Press <Win> + <H> to input text from audio..
+> # 🔊 Audio Example in the container (for Windows only):
+> node-container:$ claude-unattended # Press Keyboard <Win> + <H> to input text from audio.
 >
-> # Text Example in the container:
+> # 📝 Text Example in the container:
 > node-container:$ claude-unattended "What time is it in PST?"
 > ```
 > 
 > #### Agent Setup for Linux and Windows Subsystem Linux (Ubuntu >= 24.04):
 > ```sh
+> # Quick Health Check:
+> curl -L http://127.0.0.1:8000/v1/models
+> 
 > sudo apt-get install -y npm
 > sudo npm install -g @anthropic-ai/claude-code@2.1.199
 > curl -LO http://127.0.0.1:8000/claude.cmd
@@ -84,6 +87,9 @@ Tutel MoE: An Optimized Mixture-of-Experts Implementation, also the first parall
 > 
 > #### Agent Setup for Windows (>= 10.0):
 > ```sh
+> # Quick Health Check:
+> curl -L http://127.0.0.1:8000/v1/models
+>
 > winget install OpenJS.NodeJS.LTS
 > winget install --id Git.Git -e --source winget
 > npm install -g @anthropic-ai/claude-code@2.1.199
