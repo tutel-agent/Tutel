@@ -1719,3 +1719,219 @@ TORCH_LIBRARY_FRAGMENT(tutel_ops, m) {
 #endif
 }
 #endif
+
+
+#if defined(USE_GPU) && (defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__))
+#include <ATen/MemoryOverlap.h>
+#include <c10/core/DeviceGuard.h>
+#include <limits>
+#include <torch/library.h>
+
+#include <ATen/cuda/CUDAContext.h>
+#include <hipblaslt/hipblaslt.h>
+#include <map>
+#include <memory>
+#include <tuple>
+
+namespace tutel_bf16_indexed {
+
+static void check_lt(hipblasStatus_t status, const char *operation) {
+  TORCH_CHECK(status == HIPBLAS_STATUS_SUCCESS,
+              "bf16_indexed_gemm: ", operation, " failed: ", int(status));
+}
+
+template <typename T, hipblasStatus_t (*Destroy)(T)>
+struct LtObject {
+  T value = nullptr;
+
+  LtObject() = default;
+  LtObject(const LtObject &) = delete;
+  LtObject &operator=(const LtObject &) = delete;
+
+  ~LtObject() {
+    if (value) {
+      const auto status = Destroy(value);
+      if (status != HIPBLAS_STATUS_SUCCESS)
+        TORCH_WARN("bf16_indexed_gemm: hipBLASLt resource cleanup failed: ", int(status));
+    }
+  }
+};
+
+using LtLayout = LtObject<hipblasLtMatrixLayout_t, hipblasLtMatrixLayoutDestroy>;
+
+static void init_layout(LtLayout &layout, int64_t rows, int64_t cols, int64_t ld) {
+  check_lt(hipblasLtMatrixLayoutCreate(&layout.value, HIP_R_16BF, rows, cols, ld),
+           "hipblasLtMatrixLayoutCreate");
+  const int32_t batch_count = 1;
+  const hipblasLtBatchMode_t batch_mode = HIPBLASLT_BATCH_MODE_POINTER_ARRAY;
+  check_lt(hipblasLtMatrixLayoutSetAttribute(
+               layout.value, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+               &batch_count, sizeof(batch_count)),
+           "set batch count");
+  check_lt(hipblasLtMatrixLayoutSetAttribute(
+               layout.value, HIPBLASLT_MATRIX_LAYOUT_BATCH_MODE,
+               &batch_mode, sizeof(batch_mode)),
+           "set pointer-array batch mode (requires a supporting hipBLASLt version)");
+}
+
+struct GemmPlan {
+  LtObject<hipblasLtMatmulDesc_t, hipblasLtMatmulDescDestroy> operation;
+  LtLayout a, b, output;
+  hipblasLtMatmulAlgo_t algorithm{};
+  size_t workspace_size = 0;
+
+  GemmPlan(hipblasLtHandle_t handle, int m, int n, int k, bool weight_transposed) {
+    check_lt(hipblasLtMatmulDescCreate(&operation.value, HIPBLAS_COMPUTE_32F, HIP_R_32F),
+             "hipblasLtMatmulDescCreate");
+    const hipblasOperation_t trans_a = weight_transposed ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+    const hipblasOperation_t trans_b = HIPBLAS_OP_N;
+    const hipblasLtPointerMode_t pointer_mode = HIPBLASLT_POINTER_MODE_HOST;
+    check_lt(hipblasLtMatmulDescSetAttribute(
+                 operation.value, HIPBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)),
+             "set transpose A");
+    check_lt(hipblasLtMatmulDescSetAttribute(
+                 operation.value, HIPBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)),
+             "set transpose B");
+    check_lt(hipblasLtMatmulDescSetAttribute(
+                 operation.value, HIPBLASLT_MATMUL_DESC_POINTER_MODE,
+                 &pointer_mode, sizeof(pointer_mode)),
+             "set host scalar pointer mode");
+
+    // Column-major out^T[N,M] = op(weight storage) * data storage[K,M].
+    if (weight_transposed)
+      init_layout(a, k, n, k);
+    else
+      init_layout(a, n, k, n);
+    init_layout(b, k, m, k);
+    init_layout(output, n, m, n);
+
+    LtObject<hipblasLtMatmulPreference_t, hipblasLtMatmulPreferenceDestroy> preference;
+    check_lt(hipblasLtMatmulPreferenceCreate(&preference.value),
+             "hipblasLtMatmulPreferenceCreate");
+    constexpr uint64_t max_workspace_bytes = 256ULL * 1024 * 1024;
+    check_lt(hipblasLtMatmulPreferenceSetAttribute(
+                 preference.value, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                 &max_workspace_bytes, sizeof(max_workspace_bytes)),
+             "set maximum workspace size");
+
+    constexpr int candidate_count = 8;
+    hipblasLtMatmulHeuristicResult_t candidates[candidate_count]{};
+    int returned_count = 0;
+    check_lt(hipblasLtMatmulAlgoGetHeuristic(
+                 handle, operation.value, a.value, b.value, output.value, output.value,
+                 preference.value, candidate_count, candidates, &returned_count),
+             "hipblasLtMatmulAlgoGetHeuristic");
+    // Heuristics are ordered by estimated runtime; this is not measured autotuning.
+    for (int i = 0; i < returned_count; ++i) {
+      if (candidates[i].state == HIPBLAS_STATUS_SUCCESS &&
+          candidates[i].workspaceSize <= max_workspace_bytes) {
+        algorithm = candidates[i].algo;
+        workspace_size = candidates[i].workspaceSize;
+        return;
+      }
+    }
+    TORCH_CHECK(false, "bf16_indexed_gemm: no hipBLASLt BF16 pointer-array algorithm for ",
+                "M=", m, ", N=", n, ", K=", k, ", weight_transposed=", weight_transposed,
+                " within ", max_workspace_bytes,
+                " workspace bytes; check hipBLASLt version and GPU support");
+  }
+};
+
+static torch::Tensor execute(const torch::Tensor &data, const torch::Tensor &weight,
+                             const torch::Tensor &pointers, const torch::Tensor &out,
+                             bool weight_transposed) {
+  TORCH_CHECK(data.is_cuda(), "bf16_indexed_gemm: inputs must be ROCm GPU tensors");
+  TORCH_CHECK(data.dim() == 2, "bf16_indexed_gemm: data must be [BATCH, INPUT_DIM]");
+  TORCH_CHECK(weight.dim() == 3,
+              "bf16_indexed_gemm: weight must be [EXPERTS, OUT_DIM, INPUT_DIM] when ",
+              "weight_transposed=true, or [EXPERTS, INPUT_DIM, OUT_DIM] when false");
+  const int64_t weight_n = weight.size(weight_transposed ? 1 : 2);
+  const int64_t weight_k = weight.size(weight_transposed ? 2 : 1);
+  TORCH_CHECK(pointers.dim() == 1 && pointers.numel() == 3 && pointers.scalar_type() == at::kLong,
+              "bf16_indexed_gemm: pointers must be INT64[3] containing data, selected weight, and out device pointers");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == data.size(0) && out.size(1) == weight_n,
+              "bf16_indexed_gemm: out must be [BATCH, OUT_DIM]");
+  TORCH_CHECK(data.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16 &&
+              out.scalar_type() == at::kBFloat16,
+              "bf16_indexed_gemm: data, weight, and out must be BF16");
+  TORCH_CHECK(data.device() == weight.device() && data.device() == pointers.device() &&
+              data.device() == out.device(),
+              "bf16_indexed_gemm: all inputs must be on the same device");
+  TORCH_CHECK(data.is_contiguous() && weight.is_contiguous() && pointers.is_contiguous() &&
+              out.is_contiguous(),
+              "bf16_indexed_gemm: all inputs must be contiguous");
+  TORCH_CHECK(data.size(1) == weight_k, "bf16_indexed_gemm: INPUT_DIM mismatch for ",
+              "weight_transposed=", weight_transposed);
+  TORCH_CHECK(weight.size(0) > 0, "bf16_indexed_gemm: weight must contain at least one expert");
+  at::assert_no_overlap(out, data);
+  at::assert_no_overlap(out, weight);
+  at::assert_no_overlap(out, pointers);
+  constexpr int64_t limit = std::numeric_limits<int32_t>::max();
+  TORCH_CHECK(data.size(0) <= limit && data.size(1) <= limit && weight_n <= limit,
+              "bf16_indexed_gemm: GEMM dimensions must fit INT32");
+
+  const c10::DeviceGuard guard(data.device());
+  const int m = data.size(0), n = weight_n, k = data.size(1);
+  if (out.numel() == 0)
+    return out;
+  if (k == 0) {
+    out.zero_();
+    return out;
+  }
+
+  static_assert(sizeof(void*) == sizeof(int64_t), "64-bit device pointers required");
+  auto table = pointers.data_ptr<int64_t>();
+
+  const auto stream = at::cuda::getCurrentCUDAStream(data.get_device()).stream();
+  using PlanKey = std::tuple<int, uintptr_t, int, int, int, bool>;
+  static thread_local std::map<PlanKey, std::unique_ptr<GemmPlan>> plans;
+  const PlanKey key{data.get_device(), reinterpret_cast<uintptr_t>(stream), m, n, k,
+                    weight_transposed};
+  auto it = plans.find(key);
+  if (it == plans.end()) {
+    hipStreamCaptureStatus capture_status;
+    const auto status = hipStreamIsCapturing(stream, &capture_status);
+    TORCH_CHECK(status == hipSuccess, "bf16_indexed_gemm: hipStreamIsCapturing failed: ",
+                hipGetErrorString(status));
+    TORCH_CHECK(capture_status == hipStreamCaptureStatusNone,
+                "bf16_indexed_gemm: warm up this shape and weight orientation on the same ",
+                "device, stream, and host thread before graph capture");
+  }
+
+  hipblasLtHandle_t handle = at::cuda::getCurrentCUDABlasLtHandle();
+  if (it == plans.end()) {
+    auto plan = std::make_unique<GemmPlan>(handle, m, n, k, weight_transposed);
+    it = plans.emplace(key, std::move(plan)).first;
+  }
+  const auto &plan = *it->second;
+
+  // Allocate on the current stream; graph captures get their own allocator-managed
+  // workspace instead of sharing a persistent scratch buffer across graph replays.
+  torch::Tensor workspace;
+  void *workspace_ptr = nullptr;
+  if (plan.workspace_size != 0) {
+    workspace = torch::empty({static_cast<int64_t>(plan.workspace_size)},
+                             data.options().dtype(at::kByte));
+    workspace_ptr = workspace.data_ptr();
+  }
+
+  const float alpha = 1.0f, beta = 0.0f;
+  check_lt(hipblasLtMatmul(
+               handle, plan.operation.value,
+               &alpha, table + 1, plan.a.value,
+               table, plan.b.value,
+               &beta, table + 2, plan.output.value,
+               table + 2, plan.output.value,
+               &plan.algorithm, workspace_ptr, plan.workspace_size, stream),
+           "hipblasLtMatmul");
+  return out;
+}
+
+} // namespace tutel_bf16_indexed
+
+TORCH_LIBRARY_FRAGMENT(tutel_ops, m) {
+  m.def("bf16_indexed_gemm(Tensor data, Tensor weight, Tensor pointers, Tensor(a!) out, bool weight_transposed=True) -> Tensor(a!)",
+        torch::dispatch(c10::DispatchKey::CUDA, TORCH_FN(tutel_bf16_indexed::execute)));
+}
+#endif
+
